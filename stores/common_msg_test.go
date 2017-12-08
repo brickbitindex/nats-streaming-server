@@ -45,10 +45,10 @@ func TestCSBasicMsgStore(t *testing.T) {
 			}
 
 			payload1 := []byte("m1")
-			m1 := storeMsg(t, cs, "foo", payload1)
+			m1 := storeMsg(t, cs, "foo", 1, payload1)
 
 			payload2 := []byte("m2")
-			m2 := storeMsg(t, cs, "foo", payload2)
+			m2 := storeMsg(t, cs, "foo", 2, payload2)
 
 			if string(payload1) != string(m1.Data) {
 				t.Fatalf("Unexpected payload: %v", string(m1.Data))
@@ -103,7 +103,7 @@ func TestCSBasicMsgStore(t *testing.T) {
 			}
 
 			// Store one more mesasge to check that LastMsg is correctly updated
-			m3 := storeMsg(t, cs, "foo", []byte("last"))
+			m3 := storeMsg(t, cs, "foo", 3, []byte("last"))
 			lastMsg = msgStoreLastMsg(t, ms)
 			if !reflect.DeepEqual(lastMsg, m3) {
 				t.Fatalf("Expected last message to be %v, got %v", m3, lastMsg)
@@ -126,8 +126,8 @@ func TestCSMsgsState(t *testing.T) {
 			cs1 := storeCreateChannel(t, s, "foo")
 			cs2 := storeCreateChannel(t, s, "bar")
 
-			m1 := storeMsg(t, cs1, "foo", payload)
-			m2 := storeMsg(t, cs2, "bar", payload)
+			m1 := storeMsg(t, cs1, "foo", 1, payload)
+			m2 := storeMsg(t, cs2, "bar", 1, payload)
 
 			_, isFileStore := s.(*FileStore)
 
@@ -194,7 +194,7 @@ func TestCSMaxMsgs(t *testing.T) {
 			cs := storeCreateChannel(t, s, "foo")
 
 			for i := 0; i < totalSent; i++ {
-				storeMsg(t, cs, "foo", payload)
+				storeMsg(t, cs, "foo", uint64(i+1), payload)
 			}
 
 			count, bytes := msgStoreState(t, cs.Msgs)
@@ -224,7 +224,7 @@ func TestCSMaxMsgs(t *testing.T) {
 			// Make sure that the message is stored, but all others should
 			// be removed.
 			bigMsg := make([]byte, limits.MaxBytes+100)
-			m := storeMsg(t, cs, "foo", bigMsg)
+			m := storeMsg(t, cs, "foo", uint64(totalSent+1), bigMsg)
 			expectedBytes = uint64(m.Size())
 			if isFileStore {
 				expectedBytes += msgRecordOverhead
@@ -254,7 +254,7 @@ func TestCSMaxMsgs(t *testing.T) {
 			}
 			cs = storeCreateChannel(t, s, channelName)
 			for i := 0; i < expectedCount+10; i++ {
-				storeMsg(t, cs, channelName, payload)
+				storeMsg(t, cs, channelName, uint64(i+1), payload)
 			}
 			n, b := msgStoreState(t, cs.Msgs)
 			if n != expectedCount {
@@ -286,7 +286,7 @@ func TestCSMaxMsgs(t *testing.T) {
 			}
 			cs = storeCreateChannel(t, s, channelName)
 			for i := 0; i < expectedCount+10; i++ {
-				storeMsg(t, cs, channelName, payload)
+				storeMsg(t, cs, channelName, uint64(i+1), payload)
 			}
 			n, b = msgStoreState(t, cs.Msgs)
 			if n != expectedCount {
@@ -314,14 +314,17 @@ func TestCSMaxAge(t *testing.T) {
 
 			cs := storeCreateChannel(t, s, "foo")
 			msg := []byte("hello")
+			seq := uint64(1)
 			for i := 0; i < 10; i++ {
-				storeMsg(t, cs, "foo", msg)
+				storeMsg(t, cs, "foo", seq, msg)
+				seq++
 			}
 			// Wait a bit
 			time.Sleep(60 * time.Millisecond)
 			// Send more
 			for i := 0; i < 5; i++ {
-				storeMsg(t, cs, "foo", msg)
+				storeMsg(t, cs, "foo", seq, msg)
+				seq++
 			}
 			// Wait a bit
 			time.Sleep(60 * time.Millisecond)
@@ -347,11 +350,14 @@ func TestCSMaxAge(t *testing.T) {
 			s.SetLimits(&sl)
 
 			cs = storeCreateChannel(t, s, "bar")
-			storeMsg(t, cs, "bar", msg)
+			seq = 1
+			storeMsg(t, cs, "bar", seq, msg)
+			seq++
 			// Wait a bit
 			time.Sleep(60 * time.Millisecond)
 			// Send another message that should replace the first one
-			m2 := storeMsg(t, cs, "bar", msg)
+			m2 := storeMsg(t, cs, "bar", seq, msg)
+			seq++
 			// Wait more so that max age of initial message is passed
 			time.Sleep(60 * time.Millisecond)
 			// Ensure there is still 1 message...
@@ -382,7 +388,8 @@ func TestCSMaxAge(t *testing.T) {
 					t.Fatal("Timer should not be set")
 				}
 				// Store a message
-				storeMsg(t, cs, "bar", []byte("msg"))
+				storeMsg(t, cs, "bar", seq, []byte("msg"))
+				seq++
 				// Now timer should have been set again
 				if !isSet() {
 					t.Fatal("Timer should have been set")
@@ -422,7 +429,7 @@ func TestCSGetSeqFromStartTime(t *testing.T) {
 			msgs := make([]*pb.MsgProto, 0, count)
 			payload := []byte("hello")
 			for i := 0; i < count; i++ {
-				m := storeMsg(t, cs, "foo", payload)
+				m := storeMsg(t, cs, "foo", uint64(i+1), payload)
 				msgs = append(msgs, m)
 				time.Sleep(1 * time.Millisecond)
 			}
@@ -501,8 +508,8 @@ func TestCSFirstAndLastMsg(t *testing.T) {
 
 			msg := []byte("msg")
 			cs := storeCreateChannel(t, s, "foo")
-			storeMsg(t, cs, "foo", msg)
-			storeMsg(t, cs, "foo", msg)
+			storeMsg(t, cs, "foo", 1, msg)
+			storeMsg(t, cs, "foo", 2, msg)
 
 			if m := msgStoreFirstMsg(t, cs.Msgs); m.Sequence != 1 {
 				t.Fatalf("Unexpected first message: %v", m)
@@ -560,8 +567,8 @@ func TestCSFirstAndLastMsg(t *testing.T) {
 				t.Fatalf("Unexpected last message: %v", lastMsg)
 			}
 			// Store two new messages and check first/last updated correctly
-			storeMsg(t, cs, "foo", msg)
-			storeMsg(t, cs, "foo", msg)
+			storeMsg(t, cs, "foo", 3, msg)
+			storeMsg(t, cs, "foo", 4, msg)
 
 			getInternalFirstAndLastMsg()
 			if firstMsg == nil || firstMsg.Sequence != 3 {
@@ -588,7 +595,7 @@ func TestCSLimitsOnRecovery(t *testing.T) {
 			storeMsgs := func(cs *Channel, count, size int) {
 				msg := make([]byte, size)
 				for i := 0; i < count; i++ {
-					storeMsg(t, cs, "foo", msg)
+					storeMsg(t, cs, "foo", uint64(i+1), msg)
 				}
 			}
 

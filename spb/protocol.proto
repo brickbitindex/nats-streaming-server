@@ -7,6 +7,7 @@ syntax = "proto3";
 package spb;
 
 import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "github.com/nats-io/go-nats-streaming/pb/protocol.proto";
 
 option (gogoproto.marshaler_all) = true;
 option (gogoproto.sizer_all) = true;
@@ -49,6 +50,7 @@ message ServerInfo {
   string Close       = 6; // Subject server receives close requests on.
   string SubClose    = 7; // Subject server receives subscription close requests on.
   string AcksSubs    = 8; // Subject prefix server receives subscription acks when using pool of ack subscribers.
+  string NodeID      = 9; // Clustering node ID.
 }
 
 // ClientInfo contains information related to a Client
@@ -76,4 +78,112 @@ message CtrlMsg {
   // A control message may be sent multiple times (to different internal subscriptions).
   // This field - if set - is used by the server to reference count all messages with same RefID.
   string  RefID    = 4; 
+}
+
+// RaftJoinRequest is a request to join a Raft group.
+message RaftJoinRequest {
+  string NodeID   = 1; // ID of the joining node.
+  string NodeAddr = 2; // Address of the joining node.
+}
+
+// RaftJoinResponse is a response to a RaftJoinRequest.
+message RaftJoinResponse {
+  string Error = 1; // Error string, omitted if no error. 
+}
+
+// RaftOperation is a Raft log message.
+message RaftOperation {
+  enum Type {
+    Publish            = 0; // Message publish.
+    Subscribe          = 1; // Create client subscription.
+    RemoveSubscription = 2; // Remove client subscription.
+    CloseSubscription  = 3; // Close durable client subscription.
+    Ack                = 4; // Ack a message.
+    Send               = 5; // Message send on a client subscription.
+    Connect            = 6; // Client connection.
+    Disconnect         = 7; // Client disconnect.
+  }
+  Type               OpType           = 1; // Log message type.
+  string             Leader           = 2; // The node that proposed the operation.
+  Batch              PublishBatch     = 3; // Publish operation data.
+  AddSubscription    Sub              = 4; // Subscribe operation data.
+  RemoveSubscription Unsub            = 5; // Close/Remove Subscription operation data.
+  AckMessage         AckMsg           = 6; // Ack operation data.
+  AckMessage         SendMsg          = 7; // Send operation data.
+  AddClient          ClientConnect    = 8; // Connect operation data.
+  RemoveClient       ClientDisconnect = 9; // Disconnect operation data.       
+}
+
+// Batch is a batch of messages for replication.
+message Batch {
+  repeated pb.MsgProto Messages = 1; // Serialized MsgProtos to replicate.
+}
+
+// AddSubscription is used to replicate a new client subscription.
+message AddSubscription {
+  pb.SubscriptionRequest Request  = 1; // Subscription request to replicate.
+  string                 AckInbox = 2; // Ack inbox for the subscription.
+}
+
+// RemoveSubscription is used to remove or close a client subscription.
+message RemoveSubscription {
+  string AckInbox = 1; // Subscription ack inbox.
+  string ClientID = 2; // Client ID of subscriber.
+}
+
+// AckMessage is used to replicate a message ack.
+message AckMessage {
+  string AckInbox = 1; // Subscription ack inbox.
+  uint64 Sequence = 2; // Message sequence to ack.
+}
+
+// AddClient is used to replicate a new client connection.
+message AddClient {
+  string ClientID       = 1; // Client ID of connection.
+  string HeartbeatInbox = 2; // Inbox to send heartbeats to.
+  bool   Refresh        = 3; // Whether or not this is an existing client being refreshed.
+}
+
+// RemoveClient is used to close a client connection.
+message RemoveClient {
+  string ClientID = 1; // Client to close.
+  string Reply    = 2; // Inbox to send client response to.
+  bool   Schedule = 3; // Whether to schedule the disconnect or do it immediately.
+}
+
+// RaftSnapshotFragment is a part of a snapshot of a Raft log.
+message RaftSnapshotFragment {
+  enum Type {
+    Messages     = 0; // Channel messages.
+    Subscription = 1; // Channel subscription.
+    Conn         = 2; // Client connection.
+  }
+  Type             FragmentType = 1; // Snapshot fragment type.
+  MessagesSnapshot Msgs         = 2; // Messages fragment data.
+  SubSnapshot      Sub          = 3; // Subscription fragment data.
+  ClientSnapshot   Client       = 4; // Conn fragment data.
+}
+
+// MessagesSnapshot is a snapshot of a portion of a channel's messages.
+message MessagesSnapshot {
+  Batch MessageBatch = 1; // Channel messages.
+}
+
+// SubSnapshot is a snapshot of a channel subscription.
+message SubSnapshot {
+  SubState        State       = 1; // Subscription data.
+  string          Subject     = 2; // Subscription subject.
+  repeated uint64 AcksPending = 3; // Sequences of unacknowledged messages.
+}
+
+// ClientSnapshot is a snapshot of a client connection.
+message ClientSnapshot {
+  ClientInfo           Info = 1; // Connection metadata.
+}
+
+// ChannelGossip contains info about channels that is periodically gossiped
+// between servers in a cluster.
+message ChannelGossip {
+  string NodeID      = 1; // The cluster node ID of the origin server.
+  uint32 NumChannels = 2; // The number of channels the server has.
 }

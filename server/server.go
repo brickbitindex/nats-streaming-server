@@ -5,9 +5,12 @@ package server
 import (
 	"errors"
 	"fmt"
+	"io"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"sort"
@@ -17,15 +20,17 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hashicorp/raft"
 	natsdLogger "github.com/nats-io/gnatsd/logger"
 	"github.com/nats-io/gnatsd/server"
 	"github.com/nats-io/go-nats"
 	"github.com/nats-io/go-nats-streaming/pb"
+	"github.com/nats-io/nuid"
+
 	"github.com/nats-io/nats-streaming-server/logger"
 	"github.com/nats-io/nats-streaming-server/spb"
 	"github.com/nats-io/nats-streaming-server/stores"
 	"github.com/nats-io/nats-streaming-server/util"
-	"github.com/nats-io/nuid"
 )
 
 // A single STAN server
@@ -42,11 +47,9 @@ const (
 	DefaultSubClosePrefix = "_STAN.subclose"
 	DefaultUnSubPrefix    = "_STAN.unsub"
 	DefaultClosePrefix    = "_STAN.close"
+	defaultAcksPrefix     = "_STAN.ack"
+	defaultGossipPrefix   = "_STAN.gossip"
 	DefaultStoreType      = stores.TypeMemory
-
-	// The prefixes should not have been made public (since we do not expose ways
-	// to change them). Add the new ones as private.
-	acksSubsPoolPrefix = "_STAN.subacks"
 
 	// Prefix of subject active server is sending HBs to
 	ftHBPrefix = "_STAN.ft"
@@ -59,9 +62,6 @@ const (
 	// the client connection (total= (heartbeat interval + heartbeat timeout) * (fail count + 1)
 	DefaultMaxFailedHeartBeats = int((5 * time.Minute) / DefaultHeartBeatInterval)
 
-	// Max number of outstanding go-routines handling connect requests for
-	// duplicate client IDs.
-	defaultMaxDupCIDRoutines = 100
 	// Timeout used to ping the known client when processing a connection
 	// request for a duplicate client ID.
 	defaultCheckDupCIDTimeout = 500 * time.Millisecond
@@ -73,6 +73,21 @@ const (
 	// before starting processing. Set to 0 (or negative) to disable the wait.
 	DefaultIOSleepTime = int64(0)
 
+	// DefaultLogCacheSize is the number of Raft log entries to cache in memory
+	// to reduce disk IO.
+	DefaultLogCacheSize = 512
+
+	// DefaultLogSnapshots is the number of Raft log snapshots to retain.
+	DefaultLogSnapshots = 2
+
+	// DefaultTrailingLogs is the number of log entries to leave after a
+	// snapshot and compaction.
+	DefaultTrailingLogs = 10240
+
+	// DefaultGossipInterval is the interval in which to gossip channels to the
+	// cluster (plus some random delay).
+	DefaultGossipInterval = 30 * time.Second
+
 	// Length of the channel used to schedule subscriptions start requests.
 	// Subscriptions requests are processed from the same NATS subscription.
 	// When a subscriber starts and it has pending messages, the server
@@ -83,13 +98,11 @@ const (
 	// the default length of that channel.
 	defaultSubStartChanLen = 2048
 
-	// Length of the NATS Inbox prefix
-	natsInboxPrefixLen = len(nats.InboxPrefix)
-	// First character of a NATS Inbox. When using the ackSub pool,
-	// ackInboxes will start with a number.
-	natsInboxFirstChar = '_'
-	// Length of a NATS inbox
-	natsInboxLen = 29 // _INBOX.<nuid: 22 characters>
+	// Name of the file to store Raft log.
+	raftLogFile = "raft.log"
+
+	// Time to wait on starting a Raft operation.
+	raftApplyTimeout = 5 * time.Second
 )
 
 // Constant to indicate that sendMsgToSub() should check number of acks pending
@@ -118,6 +131,7 @@ var (
 	ErrInvalidDurName     = errors.New("stan: durable name of a durable queue subscriber can't contain the character ':'")
 	ErrUnknownClient      = errors.New("stan: unknown clientID")
 	ErrNoChannel          = errors.New("stan: no configured channel")
+	ErrClusteredRestart   = errors.New("stan: cannot restart server in clustered mode if it was not previously clustered")
 )
 
 // Shared regular expression to check clientID validity.
@@ -152,6 +166,7 @@ type ioPendingMsg struct {
 	m  *nats.Msg
 	pm pb.PubMsg
 	pa pb.PubAck
+	c  *channel
 }
 
 // Constant that defines the size of the channel that feeds the IO thread.
@@ -181,6 +196,7 @@ const (
 	FTStandby
 	Failed
 	Shutdown
+	Clustered
 )
 
 func (state State) String() string {
@@ -195,6 +211,8 @@ func (state State) String() string {
 		return "FAILED"
 	case Shutdown:
 		return "SHUTDOWN"
+	case Clustered:
+		return "CLUSTERED"
 	default:
 		return "UNKNOW STATE"
 	}
@@ -236,15 +254,110 @@ func (cs *channelStore) createChannel(s *StanServer, name string) (*channel, err
 	if err != nil {
 		return nil, err
 	}
-	return cs.create(s, name, sc), nil
+	c, err = cs.create(s, name, sc)
+	if err != nil {
+		return nil, err
+	}
+	if s.isClustered() {
+		if err := assignChannelRaft(s, c, false); err != nil {
+			return nil, err
+		}
+	} else {
+		// If not clustered, subscribe to channel acks subject.
+		sub, err := s.nc.Subscribe(fmt.Sprintf("%s.>", c.getAckSubject()), s.processAckMsg)
+		if err != nil {
+			return nil, err
+		}
+		s.nc.Flush()
+		c.acksSub = sub
+		c.acksSub.SetPendingLimits(-1, -1)
+	}
+	return c, nil
 }
 
 // low-level creation and storage in memory of a *channel
 // Lock is held on entry or not needed.
-func (cs *channelStore) create(s *StanServer, name string, sc *stores.Channel) *channel {
-	c := &channel{name: name, store: sc, ss: s.createSubStore()}
+func (cs *channelStore) create(s *StanServer, name string, sc *stores.Channel) (*channel, error) {
+	c := &channel{name: name, store: sc, ss: s.createSubStore(), stan: s}
+	lastSequence, err := c.store.Msgs.LastSequence()
+	if err != nil {
+		return nil, err
+	}
+	c.nextSequence = lastSequence + 1
 	cs.channels[name] = c
-	return c
+	return c, nil
+}
+
+func assignChannelRaft(s *StanServer, c *channel, recovery bool) error {
+	node, err := s.createChannelRaftNode(c.name, c)
+	if err != nil {
+		return err
+	}
+	c.raft = node
+
+	// If this is not a recovery, wait for a leader to be elected before
+	// proceeding.
+	if !recovery {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			if leader := node.Leader(); leader != "" {
+				// Leader was elected.
+				break
+			}
+			// Wait a bit.
+			time.Sleep(5 * time.Millisecond)
+		}
+		if node.Leader() == "" {
+			node.shutdown()
+			return errors.New("channel leader was not elected in time")
+		}
+	}
+
+	leaderWait := make(chan struct{}, 1)
+	leaderReady := func() {
+		select {
+		case leaderWait <- struct{}{}:
+		default:
+		}
+	}
+	if node.State() != raft.Leader {
+		leaderReady()
+	}
+	go func() {
+		for {
+			select {
+			case isLeader := <-node.notifyCh:
+				if isLeader {
+					err := c.leadershipAcquired()
+					leaderReady()
+					if err != nil {
+						c.stan.log.Errorf("Error on leadership acquired for channel %s: %v", c.name, err)
+						switch {
+						case err == raft.ErrRaftShutdown:
+							// Node shutdown, just return.
+							return
+						case err == raft.ErrLeadershipLost:
+							// Node lost leadership, continue loop.
+							continue
+						default:
+							// TODO: probably step down as leader?
+							panic(err)
+						}
+					}
+				} else {
+					c.leadershipLost()
+				}
+			case <-s.shutdownCh:
+				// Signal channel here to handle edge case where we might
+				// otherwise block forever on the channel when shutdown.
+				leaderReady()
+				return
+			}
+		}
+	}()
+
+	<-leaderWait
+	return nil
 }
 
 func (cs *channelStore) getAll() map[string]*channel {
@@ -290,9 +403,183 @@ func (cs *channelStore) count() int {
 }
 
 type channel struct {
-	name  string
-	store *stores.Channel
-	ss    *subStore
+	nextSequence uint64
+	leader       uint32
+	name         string
+	store        *stores.Channel
+	ss           *subStore
+	raft         *raftNode
+	lTimestamp   int64
+	acksSub      *nats.Subscription
+	stan         *StanServer
+}
+
+// Apply log is invoked once a log entry is committed.
+// It returns a value which will be made available in the
+// ApplyFuture returned by Raft.Apply method if that
+// method was called on the same Raft node as the FSM.
+func (c *channel) Apply(l *raft.Log) interface{} {
+	op := &spb.RaftOperation{}
+	if err := op.Unmarshal(l.Data); err != nil {
+		panic(err)
+	}
+	switch op.OpType {
+	case spb.RaftOperation_Publish:
+		// Message replication.
+		for _, msg := range op.PublishBatch.Messages {
+			if _, err := c.store.Msgs.Store(msg); err != nil {
+				panic(fmt.Errorf("failed to store replicated message %d on channel %s: %v",
+					msg.Sequence, c.name, err))
+			}
+		}
+	case spb.RaftOperation_Subscribe:
+		// Subscription replication.
+		sub, err := c.stan.processSub(op.Sub.Request, op.Sub.AckInbox, c)
+		if err != nil {
+			return err
+		}
+		return sub
+	case spb.RaftOperation_RemoveSubscription:
+		// Unsubscribe replication.
+		sub := c.ss.LookupByAckInbox(op.Unsub.AckInbox)
+		if sub == nil {
+			return nil
+		}
+		c.stan.closeMu.Lock()
+		err := c.stan.unsubscribe(c, op.Unsub.ClientID, sub, false)
+		c.stan.closeMu.Unlock()
+		return err
+	case spb.RaftOperation_CloseSubscription:
+		// Close subscription replication.
+		sub := c.ss.LookupByAckInbox(op.Unsub.AckInbox)
+		if sub == nil {
+			return ErrInvalidSub
+		}
+		c.stan.closeMu.Lock()
+		err := c.stan.unsubscribe(c, op.Unsub.ClientID, sub, true)
+		c.stan.closeMu.Unlock()
+		return err
+	case spb.RaftOperation_Ack:
+		// If we proposed the ack, do nothing since we already processed it as
+		// leader.
+		if op.Leader == c.stan.opts.Clustering.NodeID {
+			return nil
+		}
+		c.stan.processReplicatedAck(c, op.AckMsg.AckInbox, op.AckMsg.Sequence)
+	case spb.RaftOperation_Send:
+		// If we proposed the message sent update, do nothing since we already
+		// processed it as leader.
+		if op.Leader == c.stan.opts.Clustering.NodeID {
+			return nil
+		}
+		c.stan.processReplicatedSentMsg(c, op.SendMsg.AckInbox, op.SendMsg.Sequence)
+	default:
+		panic(fmt.Sprintf("unknown op type %s", op.OpType))
+	}
+	return nil
+}
+
+// pubMsgToMsgProto converts a PubMsg to a MsgProto and assigns a timestamp
+// which is monotonic with respect to the channel.
+func (c *channel) pubMsgToMsgProto(pm *pb.PubMsg, seq uint64) *pb.MsgProto {
+	m := &pb.MsgProto{
+		Sequence:  seq,
+		Subject:   pm.Subject,
+		Reply:     pm.Reply,
+		Data:      pm.Data,
+		Timestamp: time.Now().UnixNano(),
+	}
+	if c.lTimestamp > 0 && m.Timestamp < c.lTimestamp {
+		m.Timestamp = c.lTimestamp
+	}
+	c.lTimestamp = m.Timestamp
+	return m
+}
+
+// isLeader indicates if this node is the channel leader when in clustered mode.
+func (c *channel) isLeader() bool {
+	return atomic.LoadUint32(&c.leader) == 1
+}
+
+// leadershipAcquired should be called when this node is elected leader for the
+// channel. This should only be called when the server is running in clustered
+// mode. This performs a barrier on Raft to ensure all preceding operations are
+// applied before stepping up as leader, sets up an ack subscription, updates
+// the next sequence to assign, and attempts to redeliver any outstanding
+// messages that have expired.
+func (c *channel) leadershipAcquired() error {
+	c.stan.log.Debugf("server became leader for channel %s, performing leader promotion actions", c.name)
+	// Use a barrier to ensure all preceding operations are
+	// applied to the FSM, then update nextSequence.
+	barrier := c.raft.Barrier(30 * time.Second)
+
+	// Subscribe to channel acks subject.
+	sub, err := c.stan.nc.Subscribe(fmt.Sprintf("%s.>", c.getAckSubject()), c.stan.processAckMsg)
+	if err != nil {
+		return err
+	}
+	c.acksSub = sub
+	c.acksSub.SetPendingLimits(-1, -1)
+
+	// Wait for barrier to complete.
+	if err := barrier.Error(); err != nil {
+		return err
+	}
+
+	// Update next sequence to assign.
+	lastSequence, err := c.store.Msgs.LastSequence()
+	if err != nil {
+		return err
+	}
+	atomic.StoreUint64(&c.nextSequence, lastSequence+1)
+
+	allSubs := c.ss.getAllSubs()
+	// Attempt to redeliver outstanding messages that have expired.
+	for _, sub := range allSubs {
+		sub.Lock()
+		sub.initialized = true
+		sub.Unlock()
+		c.stan.performAckExpirationRedelivery(sub, true)
+	}
+
+	// Finally step up as leader.
+	atomic.StoreUint32(&c.leader, 1)
+	c.stan.log.Debugf("finished leader promotion actions for channel %s", c.name)
+	return nil
+}
+
+// leadershipLost should be called when this node loses leadership for the
+// channel. This should only be called when the server is running in
+// clustered mode. This removes the ack subscription.
+func (c *channel) leadershipLost() {
+	c.stan.log.Debugf("server lost leadership for channel %s, performing leader stepdown actions", c.name)
+	if c.acksSub != nil {
+		c.acksSub.Unsubscribe()
+		c.acksSub = nil
+	}
+	atomic.StoreUint32(&c.leader, 0)
+	c.stan.log.Debugf("finished leader stepdown actions for channel %s", c.name)
+}
+
+func (c *channel) getAckSubject() string {
+	return fmt.Sprintf("%s.%s", c.stan.info.AcksSubs, c.name)
+}
+
+// Snapshot is used to support log compaction. This call should
+// return an FSMSnapshot which can be used to save a point-in-time
+// snapshot of the FSM. Apply and Snapshot are not called in multiple
+// threads, but Apply will be called concurrently with Persist. This means
+// the FSM should be implemented in a fashion that allows for concurrent
+// updates while a snapshot is happening.
+func (c *channel) Snapshot() (raft.FSMSnapshot, error) {
+	return newChannelSnapshot(c), nil
+}
+
+// Restore is used to restore an FSM from a snapshot. It is not called
+// concurrently with any other command. The FSM must discard all previous
+// state.
+func (c *channel) Restore(snapshot io.ReadCloser) error {
+	return c.restoreFromSnapshot(snapshot)
 }
 
 // StanServer structure represents the STAN server
@@ -305,6 +592,7 @@ type StanServer struct {
 
 	mu         sync.RWMutex
 	shutdown   bool
+	shutdownCh chan struct{}
 	serverID   string
 	info       spb.ServerInfo // Contains cluster ID and subjects
 	natsServer *server.Server
@@ -312,19 +600,15 @@ type StanServer struct {
 	startTime  time.Time
 
 	// For scalability, a dedicated connection is used to publish
-	// messages to subscribers.
+	// messages to subscribers and for replication.
 	nc  *nats.Conn // used for most protocol messages
 	ncs *nats.Conn // used for sending to subscribers and acking publishers
+	ncr *nats.Conn // used for raft messages
 
 	wg sync.WaitGroup // Wait on go routines during shutdown
 
 	// Used when processing connect requests for client ID already registered
-	dupCIDGuard       sync.RWMutex
-	dupCIDMap         map[string]struct{}
-	dupCIDwg          sync.WaitGroup // To wait for one routine to end when we have reached the max.
-	dupCIDswg         bool           // To instruct one go routine to decrement the wait group.
-	dupCIDTimeout     time.Duration
-	dupMaxCIDRoutines int
+	dupCIDTimeout time.Duration
 
 	// Clients
 	clients *clientStore
@@ -357,18 +641,6 @@ type StanServer struct {
 	subStartCh   chan *subStartInfo
 	subStartQuit chan struct{}
 
-	// By default we create a subscription on AckInbox per subscription,
-	// but still use a single connection to receive all ACKs. So
-	// effectively, this means having a go-routine per subscription for
-	// processing of client's ACKs. The more subscriptions there are,
-	// the more go-routines the system will need. To curb this growth,
-	// there is an option to use a pool of ack subscribers.
-	acksSubsPoolSize  int
-	acksSubsIndex     int
-	acksSubs          []*nats.Subscription
-	acksSubsPrefix    string
-	acksSubsPrefixLen int
-
 	// For FT mode
 	ftnc               *nats.Conn
 	ftSubject          string
@@ -396,6 +668,17 @@ type StanServer struct {
 	trace bool
 	debug bool
 	log   *logger.StanLogger
+
+	// Metadata Raft group.
+	raft *raftNode
+}
+
+func (s *StanServer) isClustered() bool {
+	return s.opts.Clustering.Clustered
+}
+
+func (s *StanServer) isMetadataLeader() bool {
+	return s.raft.State() == raft.Leader
 }
 
 // subStore holds all known state for all subscriptions
@@ -435,7 +718,6 @@ type subState struct {
 	qstate       *queueState
 	ackWait      time.Duration // SubState.AckWaitInSecs expressed as a time.Duration
 	ackTimer     *time.Timer
-	ackSub       *nats.Subscription
 	acksPending  map[uint64]int64 // key is message sequence, value is expiration time.
 	store        stores.SubStore  // for easy access to the store interface
 
@@ -556,6 +838,20 @@ func (ss *subStore) updateState(sub *subState) {
 	}
 }
 
+// returns an array of all subscriptions (plain, online durables and queue members).
+func (ss *subStore) getAllSubs() []*subState {
+	ss.RLock()
+	subs := make([]*subState, 0, len(ss.psubs))
+	subs = append(subs, ss.psubs...)
+	for _, qs := range ss.qsubs {
+		qs.RLock()
+		subs = append(subs, qs.subs...)
+		qs.RUnlock()
+	}
+	ss.RUnlock()
+	return subs
+}
+
 // Remove a subscriber from the subscription store, leaving durable
 // subscriptions unless `unsubscribe` is true.
 func (ss *subStore) Remove(c *channel, sub *subState, unsubscribe bool) {
@@ -575,10 +871,6 @@ func (ss *subStore) Remove(c *channel, sub *subState, unsubscribe bool) {
 	}
 	// Clear the subscriptions clientID
 	sub.ClientID = ""
-	if sub.ackSub != nil {
-		sub.ackSub.Unsubscribe()
-		sub.ackSub = nil
-	}
 	ackInbox := sub.AckInbox
 	qs := sub.qstate
 	isDurable := sub.IsDurable
@@ -787,16 +1079,7 @@ func (ss *subStore) LookupByDurable(durableName string) *subState {
 
 // Lookup by ackInbox name.
 func (ss *subStore) LookupByAckInbox(ackInbox string) *subState {
-	aiLen := len(ackInbox)
 	ss.RLock()
-	if aiLen != natsInboxLen {
-		if aiLen <= ss.stan.acksSubsPrefixLen {
-			ss.RUnlock()
-			return nil
-		}
-		// Extract the actual AckInbox
-		ackInbox = ackInbox[ss.stan.acksSubsPrefixLen:]
-	}
 	sub := ss.acks[ackInbox]
 	ss.RUnlock()
 	return sub
@@ -826,9 +1109,9 @@ type Options struct {
 	ClientHBInterval   time.Duration // Interval at which server sends heartbeat to a client.
 	ClientHBTimeout    time.Duration // How long server waits for a heartbeat response.
 	ClientHBFailCount  int           // Number of failed heartbeats before server closes client connection.
-	AckSubsPoolSize    int           // Number of internal subscriptions handling incoming ACKs (0 means one per client's subscription).
 	FTGroupName        string        // Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore.
 	Partitioning       bool          // Specify if server only accepts messages/subscriptions on channels defined in StoreLimits.
+	Clustering         ClusteringOptions
 }
 
 // Clone returns a deep copy of the Options object.
@@ -1015,6 +1298,9 @@ func (s *StanServer) createNatsConnections(sOpts *Options, nOpts *server.Options
 	if err == nil && sOpts.FTGroupName != "" {
 		s.ftnc, err = s.createNatsClientConn("ft", sOpts, nOpts)
 	}
+	if err == nil && s.isClustered() {
+		s.ncr, err = s.createNatsClientConn("raft", sOpts, nOpts)
+	}
 	return err
 }
 
@@ -1043,21 +1329,24 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 		nOpts = natsOpts.Clone()
 	}
 
+	if sOpts.Clustering.Clustered {
+		// Override store sync configuration with cluster sync.
+		sOpts.FileStoreOpts.DoSync = sOpts.Clustering.Sync
+	}
+
 	s := StanServer{
-		serverID:          nuid.Next(),
-		opts:              sOpts,
-		dupCIDMap:         make(map[string]struct{}),
-		dupMaxCIDRoutines: defaultMaxDupCIDRoutines,
-		dupCIDTimeout:     defaultCheckDupCIDTimeout,
-		ioChannelQuit:     make(chan struct{}, 1),
-		ctrlMsgRefIDs:     make(map[string]int),
-		trace:             sOpts.Trace,
-		debug:             sOpts.Debug,
-		subStartCh:        make(chan *subStartInfo, defaultSubStartChanLen),
-		subStartQuit:      make(chan struct{}, 1),
-		acksSubsPoolSize:  sOpts.AckSubsPoolSize,
-		startTime:         time.Now(),
-		log:               logger.NewStanLogger(),
+		serverID:      nuid.Next(),
+		opts:          sOpts,
+		dupCIDTimeout: defaultCheckDupCIDTimeout,
+		ioChannelQuit: make(chan struct{}, 1),
+		ctrlMsgRefIDs: make(map[string]int),
+		trace:         sOpts.Trace,
+		debug:         sOpts.Debug,
+		subStartCh:    make(chan *subStartInfo, defaultSubStartChanLen),
+		subStartQuit:  make(chan struct{}, 1),
+		startTime:     time.Now(),
+		log:           logger.NewStanLogger(),
+		shutdownCh:    make(chan struct{}),
 	}
 
 	// If a custom logger is provided, use this one, otherwise, check
@@ -1069,15 +1358,6 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 	}
 
 	s.log.Noticef("Starting nats-streaming-server[%s] version %s", sOpts.ID, VERSION)
-
-	testInbox := nats.NewInbox()
-	// We rely heavily on the format of a NATS inbox.
-	// Since we vendor nats and nuid, it should not change without our knowledge.
-	if testInbox[0] != natsInboxFirstChar || len(testInbox) != natsInboxLen {
-		err := fmt.Errorf("invalid inbox format: %v", testInbox)
-		s.log.Errorf("%v", err)
-		return nil, err
-	}
 
 	// ServerID is used to check that a brodcast protocol is not ours,
 	// for instance with FT. Some err/warn messages may be printed
@@ -1182,7 +1462,11 @@ func RunServerWithOpts(stanOpts *Options, natsOpts *server.Options) (newServer *
 			}
 		}()
 	} else {
-		if err := s.start(Standalone); err != nil {
+		state := Standalone
+		if s.isClustered() {
+			state = Clustered
+		}
+		if err := s.start(state); err != nil {
 			return nil, err
 		}
 	}
@@ -1243,6 +1527,8 @@ func (s *StanServer) start(runningState State) error {
 		return nil
 	}
 
+	s.state = runningState
+
 	var (
 		err            error
 		recoveredState *stores.RecoveredState
@@ -1283,19 +1569,35 @@ func (s *StanServer) start(runningState State) error {
 			// Update the store with the server info
 			callStoreInit = true
 		}
-		// Same for AcksSubs (use of pool of subscriptions for subscriptions' acks)
-		if s.info.AcksSubs == "" {
-			s.info.AcksSubs = fmt.Sprintf("%s.%s", acksSubsPoolPrefix, subjID)
-			callStoreInit = true
+
+		// If clustering was enabled but we are recovering a server that was
+		// previously not clustered, return an error. This is not allowed
+		// because there is preexisting state that is not represented in the
+		// Raft log.
+		if s.isClustered() && s.info.NodeID == "" {
+			return ErrClusteredRestart
 		}
+		// Use recovered clustering node ID.
+		s.opts.Clustering.NodeID = s.info.NodeID
 
 		// Restore clients state
 		s.processRecoveredClients(recoveredState.Clients)
 
+		// Default Raft log path to ./<cluster-id>/<node-id> if not set. This
+		// must be done here before recovering channels since that will
+		// initialize Raft groups if clustered.
+		if s.opts.Clustering.RaftLogPath == "" {
+			s.opts.Clustering.RaftLogPath = filepath.Join(s.opts.ID, s.opts.Clustering.NodeID)
+		}
+
 		// Process recovered channels (if any).
-		recoveredSubs = s.processRecoveredChannels(recoveredState.Channels)
+		recoveredSubs, err = s.processRecoveredChannels(recoveredState.Channels)
+		if err != nil {
+			return err
+		}
 	} else {
 		s.info.ClusterID = s.opts.ID
+
 		// Generate Subjects
 		s.info.Discovery = fmt.Sprintf("%s.%s", s.opts.DiscoverPrefix, s.info.ClusterID)
 		s.info.Publish = fmt.Sprintf("%s.%s", DefaultPubPrefix, subjID)
@@ -1303,7 +1605,15 @@ func (s *StanServer) start(runningState State) error {
 		s.info.SubClose = fmt.Sprintf("%s.%s", DefaultSubClosePrefix, subjID)
 		s.info.Unsubscribe = fmt.Sprintf("%s.%s", DefaultUnSubPrefix, subjID)
 		s.info.Close = fmt.Sprintf("%s.%s", DefaultClosePrefix, subjID)
-		s.info.AcksSubs = fmt.Sprintf("%s.%s", acksSubsPoolPrefix, subjID)
+		s.info.AcksSubs = fmt.Sprintf("%s.%s", defaultAcksPrefix, subjID)
+
+		if s.opts.Clustering.Clustered {
+			// If clustered, assign a random cluster node ID if not provided.
+			if s.opts.Clustering.NodeID == "" {
+				s.opts.Clustering.NodeID = nuid.Next()
+			}
+			s.info.NodeID = s.opts.Clustering.NodeID
+		}
 
 		callStoreInit = true
 	}
@@ -1322,6 +1632,20 @@ func (s *StanServer) start(runningState State) error {
 		}
 	}
 
+	// If clustered, start metadata Raft group and start gossiping channels.
+	if s.isClustered() {
+		// Default Raft log path to ./<cluster-id>/<node-id> if not set.
+		if s.opts.Clustering.RaftLogPath == "" {
+			s.opts.Clustering.RaftLogPath = filepath.Join(s.opts.ID, s.opts.Clustering.NodeID)
+		}
+		if err := s.startMetadataRaftNode(); err != nil {
+			return err
+		}
+		if err := s.startChannelGossiping(); err != nil {
+			return err
+		}
+	}
+
 	// Start the go-routine responsible to start sending messages to newly
 	// started subscriptions. We do that before opening the gates in
 	// s.initSupscriptions() (which is where the internal subscriptions
@@ -1336,9 +1660,7 @@ func (s *StanServer) start(runningState State) error {
 	if recoveredState != nil {
 		// Do some post recovery processing (create subs on AckInbox, setup
 		// some timers, etc...)
-		if err := s.postRecoveryProcessing(recoveredState.Clients, recoveredSubs); err != nil {
-			return fmt.Errorf("error during post recovery processing: %v", err)
-		}
+		s.postRecoveryProcessing(recoveredState.Clients, recoveredSubs)
 	}
 
 	// Flush to make sure all subscriptions are processed before
@@ -1354,11 +1676,212 @@ func (s *StanServer) start(runningState State) error {
 	}
 
 	// Execute (in a go routine) redelivery of unacknowledged messages,
-	// and release newOnHold
-	s.wg.Add(1)
-	go s.performRedeliveryOnStartup(recoveredSubs)
-	s.state = runningState
+	// and release newOnHold. We only do this if not clustered. If
+	// clustered, the leader will handle redelivery upon election.
+	if !s.isClustered() {
+		s.wg.Add(1)
+		go s.performRedeliveryOnStartup(recoveredSubs)
+	}
 	return nil
+}
+
+// startChannelGossiping sets up a NATS subscription to a cluster gossip
+// subject to receive messages from the cluster on what channels exist. It also
+// starts a goroutine which periodically publishes the channels this server
+// knows about. When a server discovers it's missing channels, it requests the
+// missing channels from another server and creates them. This should only be
+// called if the server is running in clustered mode.
+func (s *StanServer) startChannelGossiping() error {
+	// Setup sub for receiving channel lists for reconciliation.
+	if _, err := s.ncr.Subscribe(s.getChannelReconcileInbox(), s.reconcileChannels); err != nil {
+		return err
+	}
+
+	// Setup sub for receiving channel gossip.
+	gossipInbox := fmt.Sprintf("%s.%s.channels", defaultGossipPrefix, s.opts.ID)
+	if _, err := s.ncr.Subscribe(gossipInbox, s.processChannelGossip); err != nil {
+		return err
+	}
+
+	// Setup sub for receiving channel requests.
+	reqInbox := fmt.Sprintf("%s.%s.channels.request.%s", defaultGossipPrefix, s.opts.ID, s.opts.Clustering.NodeID)
+	if _, err := s.ncr.Subscribe(reqInbox, s.processChannelListRequest); err != nil {
+		return err
+	}
+
+	// Start publishing channel info.
+	go func() {
+		rand.Seed(time.Now().UnixNano())
+		for {
+			// Publish on a fixed interval with some random jitter.
+			randomDelay := time.Duration(rand.Intn(6)) * time.Second
+			select {
+			case <-time.After(s.opts.Clustering.GossipInterval + randomDelay):
+				s.channels.RLock()
+				count := uint32(len(s.channels.channels))
+				s.channels.RUnlock()
+				data, err := (&spb.ChannelGossip{NodeID: s.opts.Clustering.NodeID, NumChannels: count}).Marshal()
+				if err != nil {
+					panic(err)
+				}
+				s.ncr.PublishRequest(gossipInbox, reqInbox, data)
+			case <-s.shutdownCh:
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
+// reconcileChannels is a NATS handler that handles asynchronous responses from
+// a peer after requesting the list of channels. This is done asynchronously
+// since the list can exceed the max NATS message size, so we stream the list
+// in chunks asynchronously. Reconciling channels should be idempotent.
+func (s *StanServer) reconcileChannels(m *nats.Msg) {
+	// Message cannot be empty, we are supposed to receive
+	// a spb.CtrlMsg_Partitioning protocol.
+	if len(m.Data) == 0 {
+		return
+	}
+	req := spb.CtrlMsg{}
+	if err := req.Unmarshal(m.Data); err != nil {
+		s.log.Errorf("Error processing channel reconcile request: %v", err)
+		return
+	}
+	channels, err := util.DecodeChannels(req.Data)
+	if err != nil {
+		s.log.Errorf("Error processing channel reconcile request: %v", err)
+		return
+	}
+	// Reconcile list of channels.
+	for _, channel := range channels {
+		if s.channels.get(channel) == nil {
+			if _, err := s.channels.createChannel(s, channel); err != nil {
+				s.log.Errorf("Failed to create channel %s while reconciling channels: %v", channel, err)
+			} else {
+				s.log.Debugf("Created channel %s while reconciling channels", channel)
+			}
+		}
+	}
+}
+
+// processChannelGossip is a NATS handler that handles gossip messages from
+// cluster peers containing the number of channels they have. If we detect
+// we're missing channels, request the list of channels from the server to
+// reconcile.
+func (s *StanServer) processChannelGossip(m *nats.Msg) {
+	c := &spb.ChannelGossip{}
+	if err := c.Unmarshal(m.Data); err != nil {
+		s.log.Errorf("Received invalid channel gossip message: %v", err)
+		return
+	}
+	if c.NodeID == s.opts.Clustering.NodeID {
+		// Ignore messages from ourselves.
+		return
+	}
+	s.channels.RLock()
+	count := uint32(len(s.channels.channels))
+	s.channels.RUnlock()
+
+	if count >= c.NumChannels {
+		return
+	}
+
+	// If our count is less, request the list of channels from the other
+	// server and reconcile. This is done asynchronously.
+	if err := s.ncr.PublishRequest(m.Reply, s.getChannelReconcileInbox(), nil); err != nil {
+		s.log.Errorf("Failed to fetch channels from another server: %v", err)
+		return
+	}
+}
+
+// processChannelListRequest is a NATS handler that handles requests from
+// cluster peers to stream the list of channels to them. This is done by
+// streaming the list in chunks to the peer since the list can exceed the max
+// NATS message size.
+func (s *StanServer) processChannelListRequest(m *nats.Msg) {
+	s.channels.RLock()
+	channels := make([]string, len(s.channels.channels))
+	i := 0
+	for channel, _ := range s.channels.channels {
+		channels[i] = channel
+		i++
+	}
+	s.channels.RUnlock()
+	if err := util.SendChannelsList(channels, m.Reply, "", s.ncr, s.serverID); err != nil {
+		s.log.Errorf("Failed to send channel list to peer: %v", err)
+	}
+}
+
+// getChannelReconcileInbox returns the NATS subject for streaming channels to
+// for reconciliation.
+func (s *StanServer) getChannelReconcileInbox() string {
+	return fmt.Sprintf("%s.%s.channels.reconcile.%s", defaultGossipPrefix, s.opts.ID, s.opts.Clustering.NodeID)
+}
+
+// startMetadataRaftNode creates and starts the metadata Raft group. This is
+// used to handle replication of connection state and cluster metadata. This
+// should only be called if the server is running in clustered mode.
+func (s *StanServer) startMetadataRaftNode() error {
+	node, err := s.createMetadataRaftNode(s)
+	if err != nil {
+		return err
+	}
+	s.raft = node
+
+	go func() {
+		for {
+			select {
+			case isLeader := <-node.notifyCh:
+				if isLeader {
+					s.leadershipAcquired()
+				} else {
+					s.leadershipLost()
+				}
+			case <-s.shutdownCh:
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
+// leadershipAcquired should be called when this node is elected leader for the
+// metadata group. This should only be called when the server is running in
+// clustered mode. This sets up client heartbeats.
+func (s *StanServer) leadershipAcquired() {
+	s.log.Debugf("server became metadata leader, performing leader promotion actions")
+
+	// Setup client heartbeats.
+	for _, client := range s.clients.getClients() {
+		client.RLock()
+		cID := client.info.ID
+		client.RUnlock()
+		s.clients.setClientHB(cID, s.opts.ClientHBTimeout, func() {
+			s.checkClientHealth(cID)
+		})
+	}
+
+	s.log.Debugf("finished metadata leader promotion actions")
+}
+
+// leadershipLost should be called when this node loses leadership for the
+// metadata group. This should only be called when the server is running in
+// clustered mode. This cancels all outstanding client heartbeats.
+func (s *StanServer) leadershipLost() {
+	s.log.Debugf("server lost metadata leadership, performing leader stepdown actions")
+
+	// Cancel outstanding client heartbeats. We aren't concerned about races
+	// where new clients might be connecting because at this point, the server
+	// will no longer accept new client connections, but even if it did, the
+	// heartbeat would be automatically removed when it fires.
+	for _, client := range s.clients.getClients() {
+		s.clients.removeClientHB(client)
+	}
+
+	s.log.Debugf("finished metadata leader stepdown actions")
 }
 
 // TODO:  Explore parameter passing in gnatsd.  Keep separate for now.
@@ -1525,7 +2048,7 @@ func (s *StanServer) processRecoveredClients(clients []*stores.Client) {
 // We don't use locking in there because there is no communication
 // with the NATS server and/or clients, so no chance that the state
 // changes while we are doing this.
-func (s *StanServer) processRecoveredChannels(channels map[string]*stores.RecoveredChannel) []*subState {
+func (s *StanServer) processRecoveredChannels(channels map[string]*stores.RecoveredChannel) ([]*subState, error) {
 	// We will return the recovered subscriptions
 	allSubs := make([]*subState, 0, 16)
 
@@ -1537,9 +2060,12 @@ func (s *StanServer) processRecoveredChannels(channels map[string]*stores.Recove
 		// durable would not be able to be restarted.
 		sub.ClientID = ""
 	}
-
+	isClustered := s.isClustered()
 	for channelName, recoveredChannel := range channels {
-		channel := s.channels.create(s, channelName, recoveredChannel.Channel)
+		channel, err := s.channels.create(s, channelName, recoveredChannel.Channel)
+		if err != nil {
+			return nil, err
+		}
 		// Get the recovered subscriptions for this channel.
 		for _, recSub := range recoveredChannel.Subscriptions {
 			// Create a subState
@@ -1608,69 +2134,22 @@ func (s *StanServer) processRecoveredChannels(channels map[string]*stores.Recove
 				}
 			}
 		}
+		// Delay creating of raft group to avoid races between processing of
+		// subs above and raft thread replaying the channel's raft log.
+		if isClustered {
+			if err := assignChannelRaft(s, channel, true); err != nil {
+				return nil, err
+			}
+		}
 	}
-	return allSubs
+	return allSubs, nil
 }
 
 // Do some final setup. Be minded of locking here since the server
 // has started communication with NATS server/clients.
-func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, recoveredSubs []*subState) error {
-	var err error
+func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, recoveredSubs []*subState) {
 	for _, sub := range recoveredSubs {
 		sub.Lock()
-		// To be on the safe side, just check that the ackSub has not
-		// been created (may happen with durables that may reconnect maybe?)
-		if sub.ackSub == nil {
-			if len(sub.AckInbox) <= natsInboxPrefixLen {
-				err = fmt.Errorf("invalid ack inbox: %s", sub.AckInbox)
-			} else {
-				// If the recovered AckInbox starts with nats.InboxPrefix, we
-				// need to create an individual subscription for that,
-				// regardless if the server is using ackSub pool or not.
-				ackSubject := sub.AckInbox
-				createSub := ackSubject[0] == natsInboxFirstChar
-				if !createSub {
-					// The saved AckInbox indicates that this was for a pool
-					// of acksSubs. If the server is currently not running
-					// in that mode, we need to create the subscription.
-					createSub = s.acksSubsPoolSize == 0
-					// If not, check that the recovered AckInbox index is
-					// below the pool size, otherwise we need to create an
-					// individual subscription.
-					if !createSub {
-						ackSubIndex := 0
-						ackSubIndexEnd := strings.Index(sub.AckInbox, ".")
-						if ackSubIndexEnd != -1 {
-							ackSubIndexStr := sub.AckInbox[:ackSubIndexEnd]
-							ackSubIndex, err = strconv.Atoi(ackSubIndexStr)
-							if err == nil {
-								createSub = ackSubIndex >= s.acksSubsPoolSize
-							}
-						}
-						if ackSubIndexEnd == -1 || err != nil {
-							err = fmt.Errorf("invalid ack inbox: %s", sub.AckInbox)
-						}
-					}
-					// If we need to create an individual subscription,
-					// set the appropriate ack subject.
-					if err == nil && createSub {
-						ackSubject = s.acksSubsPrefix + sub.AckInbox
-					}
-				}
-				if err == nil && createSub {
-					// Subscribe to acks
-					// Actual subject may be AckInbox prefixed with s.acksSubsPrefix.
-					sub.ackSub, err = s.nc.Subscribe(ackSubject, s.processAckMsg)
-					if err == nil {
-						sub.ackSub.SetPendingLimits(-1, -1)
-					}
-				}
-			}
-			if err != nil {
-				sub.Unlock()
-				return err
-			}
-		}
 		// Consider this subscription initialized. Note that it may
 		// still have newOnHold == true, which would prevent incoming
 		// messages to be delivered before we attempt to redeliver
@@ -1678,15 +2157,18 @@ func (s *StanServer) postRecoveryProcessing(recoveredClients []*stores.Client, r
 		sub.initialized = true
 		sub.Unlock()
 	}
-	// Go through the list of clients and ensure their Hb timer is set.
-	for _, sc := range recoveredClients {
-		// Because of the loop, we need to make copy for the closure
-		cID := sc.ID
-		s.clients.setClientHB(cID, s.opts.ClientHBTimeout, func() {
-			s.checkClientHealth(cID)
-		})
+	// Go through the list of clients and ensure their Hb timer is set. Only do
+	// this for standalone mode. If clustered, timers will be setup on leader
+	// election.
+	if !s.isClustered() {
+		for _, sc := range recoveredClients {
+			// Because of the loop, we need to make copy for the closure
+			cID := sc.ID
+			s.clients.setClientHB(cID, s.opts.ClientHBTimeout, func() {
+				s.checkClientHealth(cID)
+			})
+		}
 	}
-	return nil
 }
 
 // Redelivers unacknowledged messages and release the hold for new messages delivery
@@ -1784,22 +2266,19 @@ func (s *StanServer) initSubscriptions() error {
 	if err != nil {
 		return fmt.Errorf("could not subscribe to close request subject, %v", err)
 	}
-	// We need to set this regardless if server is currently running
-	// with the pool or not (since we may need those when recovering subscriptions)
-	s.acksSubsPrefix = s.info.AcksSubs + "."
-	s.acksSubsPrefixLen = len(s.acksSubsPrefix)
-	// Optionally receive ACKs from clients using this pool of ack subscribers.
-	if s.acksSubsPoolSize > 0 {
-		for i := 0; i < s.acksSubsPoolSize; i++ {
-			ackSub, err := s.nc.Subscribe(fmt.Sprintf("%s%d.>", s.acksSubsPrefix, i),
-				s.processAckMsg)
+	// For existing channels, in non clustering mode, create a subscription for acks
+	if !s.isClustered() {
+		channels := s.channels.getAll()
+		for _, c := range channels {
+			sub, err := s.nc.Subscribe(fmt.Sprintf("%s.>", c.getAckSubject()), s.processAckMsg)
 			if err != nil {
-				return fmt.Errorf("Could not subscribe to subscriptions acks subject: %v", err)
+				return err
 			}
-			ackSub.SetPendingLimits(-1, -1)
-			s.acksSubs = append(s.acksSubs, ackSub)
+			c.acksSub = sub
+			c.acksSub.SetPendingLimits(-1, -1)
 		}
 	}
+
 	s.log.Debugf("Discover subject:           %s", s.info.Discovery)
 	// For partitions, we actually print the list of channels
 	// in the startup banner, so we don't need to repeat them here.
@@ -1831,73 +2310,117 @@ func (s *StanServer) connectCB(m *nats.Msg) {
 		return
 	}
 
-	// Try to register
-	client, isNew, err := s.clients.register(req.ClientID, req.HeartbeatInbox)
-	if err != nil {
-		s.log.Errorf("[Client:%s] Error registering client: %v", req.ClientID, err)
-		s.sendConnectErr(m.Reply, err.Error())
+	// In clustered mode, drop the request if we're not the metadata leader.
+	// Another server will handle it.
+	if s.isClustered() && !s.isMetadataLeader() {
 		return
 	}
-	// Handle duplicate IDs in a dedicated go-routine
-	if !isNew {
-		// Do we have a routine in progress for this client ID?
-		s.dupCIDGuard.RLock()
-		_, inProgress := s.dupCIDMap[req.ClientID]
-		s.dupCIDGuard.RUnlock()
 
-		// Yes, fail this request here.
-		if inProgress {
-			s.log.Errorf("[Client:%s] Connect failed; already connected", req.ClientID)
+	// If the client ID is already registered, check to see if it's the case
+	// that the client refreshed (e.g. it crashed and came back) or if the
+	// connection is a duplicate. If it refreshed, we will close the old
+	// client and open a new one.
+	refresh := false
+	client := s.clients.lookup(req.ClientID)
+	if client != nil {
+		if s.isDuplicateConnect(client) {
+			s.log.Debugf("[Client:%s] Connect failed; already connected", req.ClientID)
 			s.sendConnectErr(m.Reply, ErrInvalidClient.Error())
 			return
 		}
+		refresh = true
+	}
 
-		// If server has started shutdown, we can't call wg.Add() so we need
-		// to check on shutdown status. Note that s.wg is for all server's
-		// go routines, not specific to duplicate CID handling. Use server's
-		// lock here.
-		s.mu.Lock()
-		shutdown := s.shutdown
-		if !shutdown {
-			// Assume we are going to start a go routine.
-			s.wg.Add(1)
-		}
-		s.mu.Unlock()
+	// If clustered, thread operations through Raft.
+	if s.isClustered() {
+		err = s.replicateConnect(req.ClientID, req.HeartbeatInbox, refresh)
+	} else {
+		err = s.processConnect(req.ClientID, req.HeartbeatInbox, refresh)
+	}
 
-		if shutdown {
-			// The client will timeout on connect
-			return
-		}
-
-		// If we have exhausted the max number of go routines, we will have
-		// to wait that one finishes.
-		needToWait := false
-
-		s.dupCIDGuard.Lock()
-		s.dupCIDMap[req.ClientID] = struct{}{}
-		if len(s.dupCIDMap) > s.dupMaxCIDRoutines {
-			s.dupCIDswg = true
-			s.dupCIDwg.Add(1)
-			needToWait = true
-		}
-		s.dupCIDGuard.Unlock()
-
-		// If we need to wait for a go routine to return...
-		if needToWait {
-			s.dupCIDwg.Wait()
-		}
-		// Start a go-routine to handle this connect request
-		go func() {
-			s.processConnectRequestWithDupID(client, req, m.Reply)
-		}()
+	if err != nil {
+		s.log.Errorf("[Client:%s] Connect failed: %v", req.ClientID, err)
+		s.sendConnectErr(m.Reply, err.Error())
 		return
 	}
 
-	// Here, we accept this client's incoming connect request.
-	s.finishConnectRequest(client, req, m.Reply)
+	// Send connect response to client and start heartbeat timer.
+	s.finishConnectRequest(req, m.Reply)
 }
 
-func (s *StanServer) finishConnectRequest(client *client, req *pb.ConnectRequest, replyInbox string) {
+// isDuplicateConnect determines if the given client ID is a duplicate
+// connection by pinging the old client's heartbeat inbox and checking if it
+// responds. If it does, it's a duplicate connection.
+func (s *StanServer) isDuplicateConnect(client *client) bool {
+	client.RLock()
+	hbInbox := client.info.HbInbox
+	client.RUnlock()
+
+	// This is the HbInbox from the "old" client. See if it is up and
+	// running by sending a ping to that inbox.
+	_, err := s.nc.Request(hbInbox, nil, s.dupCIDTimeout)
+
+	// If err is nil, the currently registered client responded, so this is a
+	// duplicate.
+	return err == nil
+}
+
+func (s *StanServer) replicateConnect(clientID, heartbeatInbox string, refresh bool) error {
+	op := &spb.RaftOperation{
+		OpType: spb.RaftOperation_Connect,
+		Leader: s.opts.Clustering.NodeID,
+		ClientConnect: &spb.AddClient{
+			ClientID:       clientID,
+			HeartbeatInbox: heartbeatInbox,
+			Refresh:        refresh,
+		},
+	}
+	data, err := op.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	future := s.raft.Apply(data, raftApplyTimeout)
+	// Wait on result of replication.
+	if err := future.Error(); err != nil {
+		return err
+	}
+
+	// Perform a barrier to ensure the connect replication is applied before
+	// returning. This prevents a race where a client connects and then makes a
+	// request before the connect has been applied.
+	s.raft.Barrier(raftApplyTimeout).Error()
+
+	resp := future.Response()
+	if resp == nil {
+		return nil
+	}
+	return resp.(error)
+}
+
+func (s *StanServer) processConnect(clientID, heartbeatInbox string, refresh bool) error {
+	// If the client refreshed, close the old one first.
+	if refresh {
+		s.closeClient(clientID)
+
+		// Because connections are processed on the same goroutine, it is not
+		// possible for a connection request for the same client ID to come in at
+		// the same time after unregistering the old client.
+	}
+
+	// Try to register
+	_, isNew, err := s.clients.register(clientID, heartbeatInbox)
+	if err != nil {
+		s.log.Errorf("[Client:%s] Error registering client: %v", clientID, err)
+		return err
+	}
+
+	if refresh && isNew {
+		s.log.Debugf("[Client:%s] Replaced old client (Inbox=%v)", clientID, heartbeatInbox)
+	}
+	return nil
+}
+
+func (s *StanServer) finishConnectRequest(req *pb.ConnectRequest, replyInbox string) {
 	cr := &pb.ConnectResponse{
 		PubPrefix:        s.info.Publish,
 		SubRequests:      s.info.Subscribe,
@@ -1916,57 +2439,6 @@ func (s *StanServer) finishConnectRequest(client *client, req *pb.ConnectRequest
 	s.log.Debugf("[Client:%s] Connected (Inbox=%v)", clientID, hbInbox)
 }
 
-func (s *StanServer) processConnectRequestWithDupID(c *client, req *pb.ConnectRequest, replyInbox string) {
-	sendErr := true
-
-	c.RLock()
-	hbInbox := c.info.HbInbox
-	clientID := c.info.ID
-	c.RUnlock()
-
-	defer func() {
-		s.dupCIDGuard.Lock()
-		delete(s.dupCIDMap, clientID)
-		if s.dupCIDswg {
-			s.dupCIDswg = false
-			s.dupCIDwg.Done()
-		}
-		s.dupCIDGuard.Unlock()
-		s.wg.Done()
-	}()
-
-	// This is the HbInbox from the "old" client. See if it is up and
-	// running by sending a ping to that inbox.
-	if _, err := s.nc.Request(hbInbox, nil, s.dupCIDTimeout); err != nil {
-		// The old client didn't reply, assume it is dead, close it and continue.
-		s.closeClient(clientID)
-
-		// Between the close and the new registration below, it is possible
-		// that a connection request came in (in connectCB) and since the
-		// client is now unregistered, the new connection was accepted there.
-		// The registration below will then fail, in which case we will fail
-		// this request.
-
-		// Need to re-register now based on the new request info.
-		var isNew bool
-		c, isNew, err = s.clients.register(req.ClientID, req.HeartbeatInbox)
-		if err == nil && isNew {
-			// We could register the new client.
-			s.log.Debugf("[Client:%s] Replaced old client (Inbox=%v)", req.ClientID, hbInbox)
-			sendErr = false
-		}
-	}
-	// The currently registered client is responding, or we failed to register,
-	// so fail the request of the incoming client connect request.
-	if sendErr {
-		s.log.Debugf("[Client:%s] Connect failed; already connected", clientID)
-		s.sendConnectErr(replyInbox, ErrInvalidClient.Error())
-		return
-	}
-	// We have replaced the old with the new.
-	s.finishConnectRequest(c, req, replyInbox)
-}
-
 func (s *StanServer) sendConnectErr(replyInbox, err string) {
 	cr := &pb.ConnectResponse{Error: err}
 	b, _ := cr.Marshal()
@@ -1977,6 +2449,13 @@ func (s *StanServer) sendConnectErr(replyInbox, err string) {
 func (s *StanServer) checkClientHealth(clientID string) {
 	client := s.clients.lookup(clientID)
 	if client == nil {
+		return
+	}
+
+	// If clustered and we lost metadata leadership, we should stop
+	// heartbeating as the new leader will take over.
+	if s.isClustered() && !s.isMetadataLeader() {
+		s.clients.removeClientHB(client)
 		return
 	}
 
@@ -2007,7 +2486,15 @@ func (s *StanServer) checkClientHealth(clientID string) {
 			// close the client (connection). This locks the
 			// client object internally so unlock here.
 			client.Unlock()
-			s.closeClient(clientID)
+			// If clustered, thread operations through Raft.
+			if s.isClustered() {
+				if err := s.replicateConnClose(clientID, "", false); err != nil {
+					s.log.Errorf("[Client:%s] Failed to replicate disconnect on heartbeat expiration: %v",
+						clientID, err)
+				}
+			} else {
+				s.closeClient(clientID)
+			}
 			return
 		}
 	} else {
@@ -2081,8 +2568,26 @@ func (s *StanServer) processCloseRequest(m *nats.Msg) {
 		return
 	}
 
+	// In clustered mode, drop the request if we're not the metadata leader.
+	// Another server will handle it.
+	if s.isClustered() && !s.isMetadataLeader() {
+		return
+	}
+
+	// If clustered, thread operations through Raft.
+	if s.isClustered() {
+		if err := s.replicateConnClose(req.ClientID, m.Reply, true); err != nil {
+			s.log.Errorf("Failed to replicate close request: %v", err)
+			s.sendCloseErr(m.Reply, err.Error())
+		}
+	} else {
+		s.scheduleConnClose(req.ClientID, m.Reply)
+	}
+}
+
+func (s *StanServer) scheduleConnClose(clientID, reply string) {
 	// Create the control and corresponding NATS message
-	ctrlMsg, ctrlNatsMsg := s.createCtrlMsg(spb.CtrlMsg_ConnClose, true, m.Reply, []byte(req.ClientID))
+	ctrlMsg, ctrlNatsMsg := s.createCtrlMsg(spb.CtrlMsg_ConnClose, true, reply, []byte(clientID))
 
 	// Lock for the remainder of the function
 	s.ctrlMsgMu.Lock()
@@ -2100,21 +2605,44 @@ func (s *StanServer) processCloseRequest(m *nats.Msg) {
 	if s.ncs.PublishMsg(ctrlNatsMsg) == nil {
 		refs++
 	}
-	subs := s.clients.getSubs(req.ClientID)
-	if len(subs) > 0 {
-		// There are subscribers, we will schedule the connection
-		// close request to subscriber's ackInbox subscribers.
-		for _, sub := range subs {
-			sub.Lock()
-			if !sub.removed {
-				// Don't use sub.AckInbox directly since it may
-				// need to be prefixed with s.acksSubsPrefix
-				ctrlNatsMsg.Subject = s.getAckSubject(sub)
-				if s.ncs.PublishMsg(ctrlNatsMsg) == nil {
-					refs++
+	subs := s.clients.getSubs(clientID)
+	// If there are subscribers, we will schedule the connection
+	// close request to subscriber's ackInbox subscribers.
+	// We now have a single ack subscriber per channel, not per
+	// subscription. So find the list of channels.
+	var (
+		channels    map[string]struct{} // created only if needed
+		isClustered = s.isClustered()
+	)
+	for _, sub := range subs {
+		sub.Lock()
+		if !sub.removed {
+			addChannel := true
+			if isClustered {
+				// In clustered mode, use only channels if this node
+				// is the leader for that channel, because otherwise
+				// the node is not listening to the ack subject.
+				c := s.channels.get(sub.subject)
+				if !c.isLeader() {
+					addChannel = false
 				}
 			}
-			sub.Unlock()
+			if addChannel {
+				// Lazy create the map
+				if channels == nil {
+					channels = make(map[string]struct{})
+				}
+				channels[sub.subject] = struct{}{}
+			}
+		}
+		sub.Unlock()
+	}
+	for cname := range channels {
+		// Server is listening to s.info.AcksSubs.channel + ".>", so use
+		// any dummy subject suffix.
+		ctrlNatsMsg.Subject = fmt.Sprintf("%s.%s.close", s.info.AcksSubs, cname)
+		if s.ncs.PublishMsg(ctrlNatsMsg) == nil {
+			refs++
 		}
 	}
 	if refs > 0 {
@@ -2126,27 +2654,47 @@ func (s *StanServer) processCloseRequest(m *nats.Msg) {
 	// If were unable to schedule a single proto, then execute
 	// performConnClose from here.
 	if refs == 0 {
-		s.performConnClose(m, req.ClientID)
+		s.performConnClose(clientID, reply)
 	}
 }
 
 // performConnClose performs a connection close operation after all
 // client's pubMsg or client acks have been processed.
-func (s *StanServer) performConnClose(m *nats.Msg, clientID string) {
+func (s *StanServer) performConnClose(clientID, reply string) {
 	// The function or the caller is already locking, so do not use
 	// locking in that function.
 	if !s.closeClient(clientID) {
 		s.log.Errorf("Unknown client %q in close request", clientID)
-		s.sendCloseErr(m.Reply, ErrUnknownClient.Error())
+		s.sendCloseErr(reply, ErrUnknownClient.Error())
 		return
 	}
 
-	resp := &pb.CloseResponse{}
-	b, _ := resp.Marshal()
-	s.nc.Publish(m.Reply, b)
+	if reply != "" {
+		resp := &pb.CloseResponse{}
+		b, _ := resp.Marshal()
+		s.nc.Publish(reply, b)
+	}
+}
+
+func (s *StanServer) replicateConnClose(clientID, reply string, schedule bool) error {
+	op := &spb.RaftOperation{
+		OpType:           spb.RaftOperation_Disconnect,
+		Leader:           s.opts.Clustering.NodeID,
+		ClientDisconnect: &spb.RemoveClient{ClientID: clientID, Reply: reply, Schedule: schedule},
+	}
+	data, err := op.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	future := s.raft.Apply(data, raftApplyTimeout)
+	// Wait on result of replication.
+	return future.Error()
 }
 
 func (s *StanServer) sendCloseErr(subj, err string) {
+	if subj == "" {
+		return
+	}
 	resp := &pb.CloseResponse{Error: err}
 	if b, err := resp.Marshal(); err == nil {
 		s.nc.Publish(subj, b)
@@ -2164,8 +2712,34 @@ func (s *StanServer) processClientPublish(m *nats.Msg) {
 		// else we will report an error below...
 	}
 
-	// Make sure we have a clientID, guid, etc.
-	if pm.Guid == "" || !s.clients.isValid(pm.ClientID) || !util.IsChannelNameValid(pm.Subject, false) {
+	// Make sure we have a guid and valid channel name.
+	if pm.Guid == "" || !util.IsChannelNameValid(pm.Subject, false) {
+		s.log.Errorf("Received invalid client publish message %v", pm)
+		s.sendPublishErr(m.Reply, pm.Guid, ErrInvalidPubReq)
+		return
+	}
+
+	if s.isClustered() {
+		c, err := s.lookupOrCreateChannel(pm.Subject)
+		if err != nil {
+			s.log.Errorf("Failed to lookup or create channel %s: %v", pm.Subject, err)
+			s.sendPublishErr(m.Reply, pm.Guid, err)
+			return
+		}
+		// If clustered and we're not the leader, drop the message. The message
+		// will be handled by another server.
+		if !c.isLeader() {
+			return
+		}
+	}
+
+	// Check if the client is valid. We do this after the clustered check so
+	// that only the leader performs this check.
+	//
+	// TODO: there is a race where the connection might not be replicated yet
+	// on this server, resulting in an invalid client id. This causes the
+	// publish to fail, so the client must retry.
+	if !s.clients.isValid(pm.ClientID) {
 		s.log.Errorf("Received invalid client publish message %v", pm)
 		s.sendPublishErr(m.Reply, pm.Guid, ErrInvalidPubReq)
 		return
@@ -2222,7 +2796,7 @@ func (s *StanServer) processCtrlMsg(m *nats.Msg) bool {
 		s.performSubUnsubOrClose(cm.MsgType, processRequest, m, req)
 	case spb.CtrlMsg_ConnClose:
 		clientID := string(cm.Data)
-		s.performConnClose(m, clientID)
+		s.performConnClose(clientID, m.Reply)
 	default:
 		return false // Valid ctrl message, but unexpected type, return failure.
 	}
@@ -2274,14 +2848,14 @@ func findBestQueueSub(sl []*subState) *subState {
 
 // Send a message to the queue group
 // Assumes qs lock held for write
-func (s *StanServer) sendMsgToQueueGroup(qs *queueState, m *pb.MsgProto, force bool) (*subState, bool, bool) {
+func (s *StanServer) sendMsgToQueueGroup(c *channel, qs *queueState, m *pb.MsgProto, force bool) (*subState, bool, bool) {
 	sub := findBestQueueSub(qs.subs)
 	if sub == nil {
 		return nil, false, false
 	}
 	sub.Lock()
 	wasStalled := sub.stalled
-	didSend, sendMore := s.sendMsgToSub(sub, m, force)
+	didSend, sendMore := s.sendMsgToSub(c, sub, m, force)
 	// If this is not a redelivery and the sub was not stalled, but now is,
 	// bump the number of stalled members.
 	if !force && !wasStalled && sub.stalled {
@@ -2398,7 +2972,7 @@ func (s *StanServer) performDurableRedelivery(c *channel, sub *subState) {
 
 		sub.Lock()
 		// Force delivery
-		s.sendMsgToSub(sub, m, forceDelivery)
+		s.sendMsgToSub(c, sub, m, forceDelivery)
 		sub.Unlock()
 	}
 	// Release newOnHold if needed.
@@ -2452,6 +3026,11 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 		return
 	}
 
+	// In cluster mode we will always redeliver to the same queue member.
+	// This is to avoid to have to replicated sent/ack when a message would
+	// be redelivered (removed from one member to be sent to another member)
+	isClustered := s.isClustered()
+
 	now := time.Now().UnixNano()
 	// limit is now plus a buffer of 15ms to avoid repeated timer callbacks.
 	limit := now + int64(15*time.Millisecond)
@@ -2504,9 +3083,9 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 		// to redeliver to, not necessarily the same one.
 		// However, on startup, resends only to member that had previously this message
 		// otherwise this could cause a message to be redelivered to multiple members.
-		if qs != nil && !isStartup {
+		if !isClustered && qs != nil && !isStartup {
 			qs.Lock()
-			pick, sent, _ = s.sendMsgToQueueGroup(qs, m, forceDelivery)
+			pick, sent, _ = s.sendMsgToQueueGroup(c, qs, m, forceDelivery)
 			qs.Unlock()
 			if pick == nil {
 				s.log.Errorf("[Client:%s] Unable to find queue subscriber for subid=%d", clientID, subID)
@@ -2521,7 +3100,7 @@ func (s *StanServer) performAckExpirationRedelivery(sub *subState, isStartup boo
 			}
 		} else {
 			sub.Lock()
-			s.sendMsgToSub(sub, m, forceDelivery)
+			s.sendMsgToSub(c, sub, m, forceDelivery)
 			sub.Unlock()
 		}
 	}
@@ -2550,12 +3129,67 @@ func (s *StanServer) getMsgForRedelivery(c *channel, sub *subState, seq uint64) 
 	return &mcopy
 }
 
+// Invoked by channel leader when a message is sent to a consumer.
+// The leader does not wait for response.
+func (s *StanServer) replicateUpdateSentMsg(c *channel, sub *subState, sequence uint64) {
+	op := &spb.RaftOperation{
+		OpType: spb.RaftOperation_Send,
+		Leader: s.opts.Clustering.NodeID,
+		SendMsg: &spb.AckMessage{
+			AckInbox: sub.AckInbox,
+			Sequence: sequence,
+		},
+	}
+	data, err := op.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	c.raft.Apply(data, raftApplyTimeout)
+}
+
+// This is invoked from raft thread on a follower. It persists given
+// sequence number to subscription of given AckInbox. It updates the
+// sub (and queue state) LastSent value. It adds the sequence to the
+// map of acksPending.
+// No lock needed.
+func (s *StanServer) processReplicatedSentMsg(c *channel, ackInbox string, sequence uint64) {
+	sub := c.ss.LookupByAckInbox(ackInbox)
+	if sub == nil {
+		return
+	}
+	sub.Lock()
+	defer sub.Unlock()
+	// If sub.LastSent is higher than the sequence, it means we already have
+	// added it. We could be here after a restart when the raft log is replayed.
+	if sequence <= sub.LastSent {
+		return
+	}
+	if err := sub.store.AddSeqPending(sub.ID, sequence); err != nil {
+		s.log.Errorf("[Client:%s] Unable to add pending message to subid=%d, subject=%s, seq=%d, err=%v",
+			sub.ClientID, sub.ID, c.name, sequence, err)
+		return
+	}
+
+	// Update LastSent if applicable
+	if sequence > sub.LastSent {
+		sub.LastSent = sequence
+	}
+	// In case this is a queue member, update queue state's LastSent.
+	if sub.qstate != nil && sequence > sub.qstate.lastSent {
+		sub.qstate.lastSent = sequence
+	}
+	// Set 0 for expiration time. This will be computed
+	// when the follower becomes leader and attempts to
+	// redeliver messages.
+	sub.acksPending[sequence] = 0
+}
+
 // Sends the message to the subscriber
 // Unless `force` is true, in which case message is always sent, if the number
 // of acksPending is greater or equal to the sub's MaxInFlight limit, messages
 // are not sent and subscriber is marked as stalled.
 // Sub lock should be held before calling.
-func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) (bool, bool) {
+func (s *StanServer) sendMsgToSub(c *channel, sub *subState, m *pb.MsgProto, force bool) (bool, bool) {
 	if sub == nil || m == nil || !sub.initialized || (sub.newOnHold && !m.Redelivered) {
 		return false, false
 	}
@@ -2611,10 +3245,17 @@ func (s *StanServer) sendMsgToSub(sub *subState, m *pb.MsgProto, force bool) (bo
 		sub.acksPending[m.Sequence] = expTime
 		return true, true
 	}
+
+	// If in cluster mode, trigger replication (but leader does
+	// not wait on quorum result.
+	if s.isClustered() {
+		s.replicateUpdateSentMsg(c, sub, m.Sequence)
+	}
+
 	// Store in storage
 	if err := sub.store.AddSeqPending(sub.ID, m.Sequence); err != nil {
 		s.log.Errorf("[Client:%s] Unable to add pending message to subid=%d, subject=%s, seq=%d, err=%v",
-			sub.ClientID, sub.ID, m.Subject, m.Sequence, err)
+			sub.ClientID, sub.ID, c.name, m.Sequence, err)
 		return false, false
 	}
 
@@ -2676,34 +3317,66 @@ func (s *StanServer) ioLoop(ready *sync.WaitGroup) {
 	////////////////////////////////////////////////////////////////////////////
 	storesToFlush := make(map[*channel]struct{}, 64)
 
-	var _pendingMsgs [ioChannelSize]*ioPendingMsg
-	var pendingMsgs = _pendingMsgs[:0]
+	var (
+		_pendingMsgs [ioChannelSize]*ioPendingMsg
+		pendingMsgs  = _pendingMsgs[:0]
+	)
 
-	storeIOPendingMsg := func(iopm *ioPendingMsg) {
-		cs, err := s.assignAndStore(&iopm.pm)
-		if err != nil {
-			s.log.Errorf("[Client:%s] Error processing message for subject %q: %v", iopm.pm.ClientID, iopm.m.Subject, err)
-			s.sendPublishErr(iopm.m.Reply, iopm.pm.Guid, err)
+	storeIOPendingMsgs := func(iopms []*ioPendingMsg) []raft.Future {
+		var (
+			futuresMap       map[*channel]raft.Future
+			replicateFutures []raft.Future
+			err              error
+			succeeded        []*ioPendingMsg
+			failed           []*ioPendingMsg
+		)
+		if s.isClustered() {
+			futuresMap, err = s.replicate(iopms)
+			if err != nil {
+				failed = iopms
+			} else {
+				succeeded = iopms
+				replicateFutures = make([]raft.Future, len(iopms))
+
+				for c := range futuresMap {
+					storesToFlush[c] = struct{}{}
+				}
+				for i, iopm := range iopms {
+					replicateFutures[i] = futuresMap[iopm.c]
+				}
+			}
 		} else {
-			pendingMsgs = append(pendingMsgs, iopm)
-			storesToFlush[cs] = struct{}{}
+			succeeded, failed, err = s.assignAndStore(iopms, storesToFlush)
 		}
+		if err != nil {
+			for _, iopm := range failed {
+				s.log.Errorf("[Client:%s] Error processing message for subject %q: %v",
+					iopm.pm.ClientID, iopm.m.Subject, err)
+				s.sendPublishErr(iopm.m.Reply, iopm.pm.Guid, err)
+			}
+		}
+		pendingMsgs = append(pendingMsgs, succeeded...)
+
+		return replicateFutures
 	}
 
-	batchSize := s.opts.IOBatchSize
-	sleepTime := s.opts.IOSleepTime
-	sleepDur := time.Duration(sleepTime) * time.Microsecond
-	max := 0
+	var (
+		batchSize = s.opts.IOBatchSize
+		sleepTime = s.opts.IOSleepTime
+		sleepDur  = time.Duration(sleepTime) * time.Microsecond
+		max       = 0
+		batch     = make([]*ioPendingMsg, 0, batchSize)
+	)
 
 	ready.Done()
 	for {
+		batch = batch[:0]
 		select {
 		case iopm := <-s.ioChannel:
-			// store the one we just pulled
-			storeIOPendingMsg(iopm)
+			batch = append(batch, iopm)
 
 			remaining := batchSize - 1
-			// fill the pending messages slice with at most our batch size,
+			// fill the message batch slice with at most our batch size,
 			// unless the channel is empty.
 			for remaining > 0 {
 				ioChanLen := len(s.ioChannel)
@@ -2728,7 +3401,7 @@ func (s *StanServer) ioLoop(ready *sync.WaitGroup) {
 				}
 
 				for i := 0; i < ioChanLen; i++ {
-					storeIOPendingMsg(<-s.ioChannel)
+					batch = append(batch, <-s.ioChannel)
 				}
 				// Keep track of max number of messages in a batch
 				if ioChanLen > max {
@@ -2736,6 +3409,21 @@ func (s *StanServer) ioLoop(ready *sync.WaitGroup) {
 					atomic.StoreInt64(&(s.ioChannelStatsMaxBatchSize), int64(max))
 				}
 				remaining -= ioChanLen
+			}
+
+			replicateFutures := storeIOPendingMsgs(batch)
+
+			// If clustered, wait on the result of replication.
+			if s.isClustered() {
+				for i, future := range replicateFutures {
+					iopm = pendingMsgs[i]
+					if err := future.Error(); err != nil {
+						s.log.Errorf("[Client:%s] Error replicating message for subject %q: %v",
+							iopm.pm.ClientID, iopm.m.Subject, err)
+						s.sendPublishErr(iopm.m.Reply, iopm.pm.Guid, fmt.Errorf("replication error: %s", err))
+						pendingMsgs[i] = nil
+					}
+				}
 			}
 
 			// flush all the stores with messages written to them...
@@ -2757,6 +3445,10 @@ func (s *StanServer) ioLoop(ready *sync.WaitGroup) {
 			// Ack our messages back to the publisher
 			for i := range pendingMsgs {
 				iopm := pendingMsgs[i]
+				if iopm == nil {
+					// Was removed because replication failed.
+					continue
+				}
 				s.ackPublisher(iopm)
 				pendingMsgs[i] = nil
 			}
@@ -2770,16 +3462,63 @@ func (s *StanServer) ioLoop(ready *sync.WaitGroup) {
 	}
 }
 
-// assignAndStore will assign a sequence ID and then store the message.
-func (s *StanServer) assignAndStore(pm *pb.PubMsg) (*channel, error) {
-	c, err := s.lookupOrCreateChannel(pm.Subject)
-	if err != nil {
-		return nil, err
+// assignAndStore will assign a sequence ID and then store the message. This
+// should not be called if running in clustered mode.
+func (s *StanServer) assignAndStore(iopms []*ioPendingMsg, storesToFlush map[*channel]struct{}) ([]*ioPendingMsg, []*ioPendingMsg, error) {
+	for i, iopm := range iopms {
+		pm := &iopm.pm
+		c, err := s.lookupOrCreateChannel(pm.Subject)
+		if err != nil {
+			return iopms[:i], iopms[i:], err
+		}
+		msg := c.pubMsgToMsgProto(pm, c.nextSequence)
+		if _, err := c.store.Msgs.Store(msg); err != nil {
+			return iopms[:i], iopms[i:], err
+		}
+		c.nextSequence++
+		storesToFlush[c] = struct{}{}
 	}
-	if _, err := c.store.Msgs.Store(pm.Data); err != nil {
-		return nil, err
+	return iopms, nil, nil
+}
+
+// replicate will replicate the batch of messages to followers and return
+// futures (one for each channel messages were replicated for) which, when
+// waited upon, will indicate if the replication was successful or not. This
+// should only be called if running in clustered mode.
+func (s *StanServer) replicate(iopms []*ioPendingMsg) (map[*channel]raft.Future, error) {
+	var (
+		futures = make(map[*channel]raft.Future)
+		batches = make(map[*channel]*spb.Batch)
+	)
+	for _, iopm := range iopms {
+		pm := &iopm.pm
+		c, err := s.lookupOrCreateChannel(pm.Subject)
+		if err != nil {
+			return nil, err
+		}
+		msg := c.pubMsgToMsgProto(pm, atomic.LoadUint64(&c.nextSequence))
+		batch := batches[c]
+		if batch == nil {
+			batch = &spb.Batch{}
+			batches[c] = batch
+		}
+		batch.Messages = append(batch.Messages, msg)
+		iopm.c = c
+		atomic.AddUint64(&c.nextSequence, 1)
 	}
-	return c, nil
+	for c, batch := range batches {
+		op := &spb.RaftOperation{
+			OpType:       spb.RaftOperation_Publish,
+			PublishBatch: batch,
+			Leader:       s.opts.Clustering.NodeID,
+		}
+		data, err := op.Marshal()
+		if err != nil {
+			panic(err)
+		}
+		futures[c] = c.raft.Apply(data, raftApplyTimeout)
+	}
+	return futures, nil
 }
 
 // ackPublisher sends the ack for a message.
@@ -2896,6 +3635,12 @@ func (s *StanServer) performSubUnsubOrClose(reqType spb.CtrlMsg_Type, schedule b
 		return
 	}
 
+	// In clustered mode, drop the request if we are not the channel leader.
+	// Another server will handle it.
+	if s.isClustered() && !c.isLeader() {
+		return
+	}
+
 	// Get the subStore
 	ss := c.ss
 
@@ -2907,10 +3652,6 @@ func (s *StanServer) performSubUnsubOrClose(reqType spb.CtrlMsg_Type, schedule b
 		return
 	}
 
-	// Lock for the remainder of the function
-	s.closeMu.Lock()
-	defer s.closeMu.Unlock()
-
 	if schedule {
 		processInPlace := false
 		sub.Lock()
@@ -2918,9 +3659,7 @@ func (s *StanServer) performSubUnsubOrClose(reqType spb.CtrlMsg_Type, schedule b
 		if !removed {
 			// We send a single message to a single handler, no need for ref count
 			_, ctrlNatsMsg := s.createCtrlMsg(reqType, false, m.Reply, m.Data)
-			// Don't use sub.AckInbox directly since it may
-			// need to be prefixed with s.acksSubsPrefix.
-			ctrlNatsMsg.Subject = s.getAckSubject(sub)
+			ctrlNatsMsg.Subject = sub.AckInbox
 			// In case of error, process the request in place.
 			if s.ncs.PublishMsg(ctrlNatsMsg) != nil {
 				processInPlace = true
@@ -2932,24 +3671,75 @@ func (s *StanServer) performSubUnsubOrClose(reqType spb.CtrlMsg_Type, schedule b
 		}
 	}
 
-	// Remove from Client
-	if !s.clients.removeSub(req.ClientID, sub) {
-		s.log.Errorf("[Client:%s] %s request for missing client", req.ClientID, action)
-		s.sendSubscriptionResponseErr(m.Reply, ErrUnknownClient)
-		return
-	}
+	if s.isClustered() {
+		// If clustered, replicate unsubscribe operation.
+		var err error
+		if isSubClose {
+			err = s.replicateCloseSubscription(c, req.ClientID, req.Inbox)
+		} else {
+			err = s.replicateRemoveSubscription(c, req.ClientID, req.Inbox)
+		}
+		if err != nil {
+			s.log.Errorf("[Client:%s] %s request replication failed: %v", req.ClientID, action, err)
+			s.sendSubscriptionResponseErr(m.Reply, err)
+			return
+		}
+	} else {
+		// Lock for the remainder of the function
+		s.closeMu.Lock()
+		defer s.closeMu.Unlock()
 
-	// Remove the subscription
-	unsubscribe := !isSubClose
-	ss.Remove(c, sub, unsubscribe)
-	s.monMu.Lock()
-	s.numSubs--
-	s.monMu.Unlock()
+		if err := s.unsubscribe(c, req.ClientID, sub, isSubClose); err != nil {
+			s.log.Errorf("[Client:%s] %s request failed: %v", req.ClientID, action, err)
+			s.sendSubscriptionResponseErr(m.Reply, err)
+			return
+		}
+	}
 
 	// Create a non-error response
 	resp := &pb.SubscriptionResponse{AckInbox: req.Inbox}
 	b, _ := resp.Marshal()
 	s.ncs.Publish(m.Reply, b)
+}
+
+func (s *StanServer) unsubscribe(c *channel, clientID string, sub *subState, isSubClose bool) error {
+	// Remove from Client
+	if !s.clients.removeSub(clientID, sub) {
+		return ErrUnknownClient
+	}
+
+	// Remove the subscription
+	unsubscribe := !isSubClose
+	c.ss.Remove(c, sub, unsubscribe)
+	s.monMu.Lock()
+	s.numSubs--
+	s.monMu.Unlock()
+	return nil
+}
+
+func (s *StanServer) replicateRemoveSubscription(c *channel, clientID, ackInbox string) error {
+	return s.replicateUnsubscribe(c, clientID, ackInbox, spb.RaftOperation_RemoveSubscription)
+}
+
+func (s *StanServer) replicateCloseSubscription(c *channel, clientID, ackInbox string) error {
+	return s.replicateUnsubscribe(c, clientID, ackInbox, spb.RaftOperation_CloseSubscription)
+}
+
+func (s *StanServer) replicateUnsubscribe(c *channel, clientID, ackInbox string, opType spb.RaftOperation_Type) error {
+	op := &spb.RaftOperation{
+		OpType: opType,
+		Leader: s.opts.Clustering.NodeID,
+		Unsub: &spb.RemoveSubscription{
+			AckInbox: ackInbox,
+			ClientID: clientID,
+		},
+	}
+	data, err := op.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	// Wait on result of replication.
+	return c.raft.Apply(data, raftApplyTimeout).Error()
 }
 
 func (s *StanServer) sendSubscriptionResponseErr(reply string, err error) {
@@ -3045,6 +3835,34 @@ func durableKey(sr *pb.SubscriptionRequest) string {
 	return fmt.Sprintf("%s-%s-%s", sr.ClientID, sr.Subject, sr.DurableName)
 }
 
+// replicateSub replicates the SubscriptionRequest to nodes in the cluster via
+// Raft.
+func (s *StanServer) replicateSub(sr *pb.SubscriptionRequest, ackInbox string, c *channel) (*subState, error) {
+	op := &spb.RaftOperation{
+		OpType: spb.RaftOperation_Subscribe,
+		Leader: s.opts.Clustering.NodeID,
+		Sub: &spb.AddSubscription{
+			Request:  sr,
+			AckInbox: ackInbox,
+		},
+	}
+	data, err := op.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	// Replicate operation and wait on result.
+	future := c.raft.Apply(data, raftApplyTimeout)
+	if err := future.Error(); err != nil {
+		return nil, err
+	}
+	resp := future.Response()
+	err, ok := resp.(error)
+	if ok {
+		return nil, err
+	}
+	return resp.(*subState), nil
+}
+
 // addSubscription adds `sub` to the client and store.
 func (s *StanServer) addSubscription(ss *subStore, sub *subState) error {
 	// Store in client
@@ -3082,80 +3900,20 @@ func (s *StanServer) updateDurable(ss *subStore, sub *subState) error {
 	return nil
 }
 
-// processSubscriptionRequest will process a subscription request.
-func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
-	sr := &pb.SubscriptionRequest{}
-	err := sr.Unmarshal(m.Data)
-	if err != nil {
-		s.log.Errorf("Invalid Subscription request from %s: %v", m.Subject, err)
-		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidSubReq)
-		return
-	}
-
-	// ClientID must not be empty.
-	if sr.ClientID == "" {
-		s.log.Errorf("Missing ClientID in subscription request from %s", m.Subject)
-		s.sendSubscriptionResponseErr(m.Reply, ErrMissingClient)
-		return
-	}
-
-	// AckWait must be >= 1s (except in test mode where negative value means that
-	// duration should be interpreted as Milliseconds)
-	if !testAckWaitIsInMillisecond && sr.AckWaitInSecs <= 0 {
-		s.log.Errorf("[Client:%s] Invalid AckWait (%v) in subscription request from %s",
-			sr.ClientID, sr.AckWaitInSecs, m.Subject)
-		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidAckWait)
-		return
-	}
-
-	// MaxInflight must be >= 1
-	if sr.MaxInFlight <= 0 {
-		s.log.Errorf("[Client:%s] Invalid MaxInflight (%v) in subscription request from %s",
-			sr.ClientID, sr.MaxInFlight, m.Subject)
-		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidMaxInflight)
-		return
-	}
-
-	// StartPosition between StartPosition_NewOnly and StartPosition_First
-	if sr.StartPosition < pb.StartPosition_NewOnly || sr.StartPosition > pb.StartPosition_First {
-		s.log.Errorf("[Client:%s] Invalid StartPosition (%v) in subscription request from %s",
-			sr.ClientID, int(sr.StartPosition), m.Subject)
-		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidStart)
-		return
-	}
-
-	// Make sure subject is valid
-	if !util.IsChannelNameValid(sr.Subject, false) {
-		s.log.Errorf("[Client:%s] Invalid channel %q in subscription request from %s",
-			sr.ClientID, sr.Subject, m.Subject)
-		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidSubject)
-		return
-	}
-
-	// In partitioning mode, do not fail the subscription request
-	// if this server does not have the channel. It could be that there
-	// is another server out there that will accept the subscription.
-	// If not, the client will get a subscription request timeout.
-	if s.partitions != nil {
-		if r := s.partitions.sl.Match(sr.Subject); len(r) == 0 {
-			return
+// processSub adds the subscription to the server.
+func (s *StanServer) processSub(sr *pb.SubscriptionRequest, ackInbox string, c *channel) (*subState, error) {
+	var (
+		sub *subState
+		err error
+		ss  = c.ss
+	)
+	if s.isClustered() {
+		// We could be here as result of replay since last snapshot.
+		// If we already have the sub from the store recovery, we are done.
+		if sub := c.ss.LookupByAckInbox(ackInbox); sub != nil {
+			return sub, nil
 		}
 	}
-
-	// Grab channel state, create a new one if needed.
-	c, err := s.lookupOrCreateChannel(sr.Subject)
-	if err != nil {
-		s.log.Errorf("Unable to create store for subject %s", sr.Subject)
-		s.sendSubscriptionResponseErr(m.Reply, err)
-		return
-	}
-	// Get the subStore
-	ss := c.ss
-
-	var sub *subState
-
-	ackInbox, ackSubject := s.createAckInboxAndSubject()
-
 	// Will be true for durable queue subscribers and durable subscribers alike.
 	isDurable := false
 	// Will be set to false for en existing durable subscriber or existing
@@ -3169,8 +3927,7 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 			if strings.Contains(sr.DurableName, ":") {
 				s.log.Errorf("[Client:%s] Invalid DurableName (%q) for queue subscriber from %s",
 					sr.ClientID, sr.DurableName, sr.Subject)
-				s.sendSubscriptionResponseErr(m.Reply, ErrInvalidDurName)
-				return
+				return nil, ErrInvalidDurName
 			}
 			isDurable = true
 			// Make the queue group a compound name between durable name and q group.
@@ -3200,10 +3957,8 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 			clientID := sub.ClientID
 			sub.RUnlock()
 			if clientID != "" {
-				s.log.Errorf("[Client:%s] Invalid ClientID in subscription request from %s",
-					sr.ClientID, m.Subject)
-				s.sendSubscriptionResponseErr(m.Reply, ErrDupDurable)
-				return
+				s.log.Errorf("[Client:%s] Duplicate durable subscription registration", sr.ClientID)
+				return nil, ErrDupDurable
 			}
 			setStartPos = false
 		}
@@ -3277,8 +4032,7 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 		ss.Remove(c, sub, false)
 		s.closeMu.Unlock()
 		s.log.Errorf("Unable to add subscription for %s: %v", sr.Subject, err)
-		s.sendSubscriptionResponseErr(m.Reply, err)
-		return
+		return nil, err
 	}
 	if s.debug {
 		traceCtx := subStateTraceCtx{clientID: sr.ClientID, isNew: subIsNew, startTrace: subStartTrace}
@@ -3289,26 +4043,105 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 	s.numSubs++
 	s.monMu.Unlock()
 
-	// In case this is a durable, sub already exists so we need to protect access
-	sub.Lock()
-	// Subscribe to acks.
-	if s.acksSubsPoolSize == 0 {
-		// We MUST use the same connection than all other internal subscribers
-		// if we want to receive messages in order from NATS server.
-		sub.ackSub, err = s.nc.Subscribe(ackInbox, s.processAckMsg)
-		if err != nil {
-			sub.Unlock()
-			panic(fmt.Sprintf("Could not subscribe to ack subject, %v\n", err))
-		}
-		sub.ackSub.SetPendingLimits(-1, -1)
-		// However, we need to flush to ensure that NATS server processes
-		// this subscription request before we return OK and start sending
-		// messages to the client.
-		s.nc.Flush()
+	return sub, nil
+}
+
+// processSubscriptionRequest will process a subscription request.
+func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
+	sr := &pb.SubscriptionRequest{}
+	err := sr.Unmarshal(m.Data)
+	if err != nil {
+		s.log.Errorf("Invalid Subscription request from %s: %v", m.Subject, err)
+		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidSubReq)
+		return
 	}
 
+	// ClientID must not be empty.
+	if sr.ClientID == "" {
+		s.log.Errorf("Missing ClientID in subscription request from %s", m.Subject)
+		s.sendSubscriptionResponseErr(m.Reply, ErrMissingClient)
+		return
+	}
+
+	// AckWait must be >= 1s (except in test mode where negative value means that
+	// duration should be interpreted as Milliseconds)
+	if !testAckWaitIsInMillisecond && sr.AckWaitInSecs <= 0 {
+		s.log.Errorf("[Client:%s] Invalid AckWait (%v) in subscription request from %s",
+			sr.ClientID, sr.AckWaitInSecs, m.Subject)
+		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidAckWait)
+		return
+	}
+
+	// MaxInflight must be >= 1
+	if sr.MaxInFlight <= 0 {
+		s.log.Errorf("[Client:%s] Invalid MaxInflight (%v) in subscription request from %s",
+			sr.ClientID, sr.MaxInFlight, m.Subject)
+		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidMaxInflight)
+		return
+	}
+
+	// StartPosition between StartPosition_NewOnly and StartPosition_First
+	if sr.StartPosition < pb.StartPosition_NewOnly || sr.StartPosition > pb.StartPosition_First {
+		s.log.Errorf("[Client:%s] Invalid StartPosition (%v) in subscription request from %s",
+			sr.ClientID, int(sr.StartPosition), m.Subject)
+		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidStart)
+		return
+	}
+
+	// Make sure subject is valid
+	if !util.IsChannelNameValid(sr.Subject, false) {
+		s.log.Errorf("[Client:%s] Invalid channel %q in subscription request from %s",
+			sr.ClientID, sr.Subject, m.Subject)
+		s.sendSubscriptionResponseErr(m.Reply, ErrInvalidSubject)
+		return
+	}
+
+	// In partitioning mode, do not fail the subscription request
+	// if this server does not have the channel. It could be that there
+	// is another server out there that will accept the subscription.
+	// If not, the client will get a subscription request timeout.
+	if s.partitions != nil {
+		if r := s.partitions.sl.Match(sr.Subject); len(r) == 0 {
+			return
+		}
+	}
+
+	// Grab channel state, create a new one if needed.
+	c, err := s.lookupOrCreateChannel(sr.Subject)
+	if err != nil {
+		s.log.Errorf("Unable to create store for subject %s", sr.Subject)
+		s.sendSubscriptionResponseErr(m.Reply, err)
+		return
+	}
+
+	// In clustered mode, drop the request if we are not the channel leader.
+	// Another server will handle it.
+	if s.isClustered() && !c.isLeader() {
+		return
+	}
+
+	var (
+		sub      *subState
+		ackInbox = fmt.Sprintf("%s.%s", c.getAckSubject(), nuid.Next())
+	)
+
+	// If clustered, thread operations through Raft.
+	if s.isClustered() {
+		sub, err = s.replicateSub(sr, ackInbox, c)
+	} else {
+		sub, err = s.processSub(sr, ackInbox, c)
+	}
+
+	if err != nil {
+		s.sendSubscriptionResponseErr(m.Reply, err)
+		return
+	}
+
+	// In case this is a durable, sub already exists so we need to protect access
+	sub.Lock()
+
 	// Create a non-error response
-	resp := &pb.SubscriptionResponse{AckInbox: ackSubject}
+	resp := &pb.SubscriptionResponse{AckInbox: sub.AckInbox}
 	b, _ := resp.Marshal()
 	s.ncs.Publish(m.Reply, b)
 
@@ -3321,7 +4154,7 @@ func (s *StanServer) processSubscriptionRequest(m *nats.Msg) {
 	sub.initialized = true
 	sub.Unlock()
 
-	s.subStartCh <- &subStartInfo{c: c, sub: sub, qs: qs, isDurable: isDurable}
+	s.subStartCh <- &subStartInfo{c: c, sub: sub, qs: qs, isDurable: sub.IsDurable}
 }
 
 type subStateTraceCtx struct {
@@ -3380,43 +4213,6 @@ func traceSubState(log logger.Logger, sub *subState, ctx *subStateTraceCtx) {
 		ctx.clientID, action, sub.subject, sub.Inbox, specific, sub.ID, sending)
 }
 
-// createAckInboxAndSubject returns an AckInbox.
-// Based on the configuration, this is simply a nats.NewInbox()
-// or a unique subject with a prefix that corresponds to one
-// of the acksSub pooled subscription.
-// NOTE: So far, this function is called from a single go-routine,
-// so no locking for s.acksSubIndex is required.
-func (s *StanServer) createAckInboxAndSubject() (string, string) {
-	ackInbox := nats.NewInbox()
-	ackInboxSubject := ackInbox
-	if s.acksSubsPoolSize > 0 {
-		// Convert _INBOX.abcdefghijk to abcdefghijk
-		ackInbox = ackInbox[natsInboxPrefixLen:]
-		// Then prefix with the index of one of the ackSub in the array.
-		// Use round-robin for now.
-		acksSubsIndex := s.acksSubsIndex
-		s.acksSubsIndex++
-		if s.acksSubsIndex >= s.acksSubsPoolSize {
-			s.acksSubsIndex = 0
-		}
-		// This results in ackInbox being something like: 2.abcdefghijk
-		ackInbox = fmt.Sprintf("%d.%s", acksSubsIndex, ackInbox)
-		// The client will send the acks to a subject that looks like:
-		// _STAN.subacks.2.abcdefghijk
-		ackInboxSubject = s.acksSubsPrefix + ackInbox
-	}
-	return ackInbox, ackInboxSubject
-}
-
-// getAckSubject returns the proper ACK subject for the given subscription.
-// Assumes sub's lock is held on entry and sub has not been removed.
-func (s *StanServer) getAckSubject(sub *subState) string {
-	if sub.ackSub != nil {
-		return sub.ackSub.Subject
-	}
-	return s.acksSubsPrefix + sub.AckInbox
-}
-
 func (s *StanServer) processSubscriptionsStart() {
 	defer s.wg.Done()
 	for {
@@ -3455,15 +4251,54 @@ func (s *StanServer) processAckMsg(m *nats.Msg) {
 		s.log.Errorf("Unable to process ack seq=%d, channel %s not found", ack.Sequence, ack.Subject)
 		return
 	}
-	s.processAck(c, c.ss.LookupByAckInbox(m.Subject), ack.Sequence)
+	sub := c.ss.LookupByAckInbox(m.Subject)
+	if sub == nil {
+		return
+	}
+	s.processAck(c, sub, ack.Sequence)
+}
+
+// replicateAck replicates an ack via Raft.
+func (s *StanServer) replicateAck(c *channel, ackInbox string, sequence uint64) {
+	op := &spb.RaftOperation{
+		OpType: spb.RaftOperation_Ack,
+		Leader: s.opts.Clustering.NodeID,
+		AckMsg: &spb.AckMessage{
+			AckInbox: ackInbox,
+			Sequence: sequence,
+		},
+	}
+	data, err := op.Marshal()
+	if err != nil {
+		panic(err)
+	}
+	c.raft.Apply(data, raftApplyTimeout)
+}
+
+// This is invoked from raft thread on a follower and persists an ACK
+// for a given subscription and removes the corresponding sequence
+// from the pending map.
+// No lock required.
+func (s *StanServer) processReplicatedAck(c *channel, ackInbox string, sequence uint64) {
+	sub := c.ss.LookupByAckInbox(ackInbox)
+	if sub == nil {
+		return
+	}
+	sub.Lock()
+	defer sub.Unlock()
+	// We cannot detect if the ACK was processed before the replay of
+	// the raft log (on restart). So the store has to be idempotent
+	// when it comes to storing the same ACK for a given sequence.
+	if err := sub.store.AckSeqPending(sub.ID, sequence); err != nil {
+		s.log.Errorf("[Client:%s] Unable to persist ack for subid=%d, subject=%s, seq=%d, err=%v",
+			sub.ClientID, sub.ID, sub.subject, sequence, err)
+		return
+	}
+	delete(sub.acksPending, sequence)
 }
 
 // processAck processes an ack and if needed sends more messages.
 func (s *StanServer) processAck(c *channel, sub *subState, sequence uint64) {
-	if sub == nil {
-		return
-	}
-
 	var stalled bool
 
 	// This is immutable, so can grab outside of sub's lock.
@@ -3475,6 +4310,12 @@ func (s *StanServer) processAck(c *channel, sub *subState, sequence uint64) {
 	}
 
 	sub.Lock()
+
+	// If in cluster mode, replicate the ack but leader
+	// does not wait on quorum result.
+	if s.isClustered() {
+		s.replicateAck(c, sub.AckInbox, sequence)
+	}
 
 	if s.trace {
 		s.log.Tracef("[Client:%s] Processing ack for subid=%d, subject=%s, seq=%d",
@@ -3521,8 +4362,8 @@ func (s *StanServer) processAck(c *channel, sub *subState, sequence uint64) {
 		return
 	}
 
-	if qs != nil {
-		s.sendAvailableMessagesToQueue(c, qs)
+	if sub.qstate != nil {
+		s.sendAvailableMessagesToQueue(c, sub.qstate)
 	} else {
 		s.sendAvailableMessages(c, sub)
 	}
@@ -3544,7 +4385,7 @@ func (s *StanServer) sendAvailableMessagesToQueue(c *channel, qs *queueState) {
 		if nextMsg == nil {
 			break
 		}
-		if _, sent, sendMore := s.sendMsgToQueueGroup(qs, nextMsg, honorMaxInFlight); !sent || !sendMore {
+		if _, sent, sendMore := s.sendMsgToQueueGroup(c, qs, nextMsg, honorMaxInFlight); !sent || !sendMore {
 			break
 		}
 	}
@@ -3559,7 +4400,7 @@ func (s *StanServer) sendAvailableMessages(c *channel, sub *subState) {
 		if nextMsg == nil {
 			break
 		}
-		if sent, sendMore := s.sendMsgToSub(sub, nextMsg, honorMaxInFlight); !sent || !sendMore {
+		if sent, sendMore := s.sendMsgToSub(c, sub, nextMsg, honorMaxInFlight); !sent || !sendMore {
 			break
 		}
 	}
@@ -3746,6 +4587,8 @@ func (s *StanServer) Shutdown() {
 		return
 	}
 
+	close(s.shutdownCh)
+
 	// Allows Shutdown() to be idempotent
 	s.shutdown = true
 	// Change the state too
@@ -3762,6 +4605,7 @@ func (s *StanServer) Shutdown() {
 	// without locking. Once closed, s.nc.xxx() calls will simply fail, but
 	// we won't panic.
 	ncs := s.ncs
+	ncr := s.ncr
 	nc := s.nc
 	ftnc := s.ftnc
 
@@ -3782,11 +4626,32 @@ func (s *StanServer) Shutdown() {
 	if s.partitions != nil {
 		s.partitions.shutdown()
 	}
+	// Capture this under lock
+	channelStore := s.channels
 	s.mu.Unlock()
 
 	// Make sure the StoreIOLoop returns before closing the Store
 	if waitForIOStoreLoop {
 		s.ioChannelWG.Wait()
+	}
+
+	// Close channels RAFT related resources before closing store.
+	if channelStore != nil {
+		channels := channelStore.getAll()
+		for _, channel := range channels {
+			if channel.raft != nil {
+				if err := channel.raft.shutdown(); err != nil {
+					s.log.Errorf("Failed to stop Raft node for channel %s: %v", channel.name, err)
+				}
+			}
+		}
+	}
+
+	// Close metadata Raft group.
+	if s.raft != nil {
+		if err := s.raft.shutdown(); err != nil {
+			s.log.Errorf("Failed to stop metadata Raft node: %v", err)
+		}
 	}
 
 	// Close/Shutdown resources. Note that unless one instantiates StanServer
@@ -3797,6 +4662,9 @@ func (s *StanServer) Shutdown() {
 	}
 	if ncs != nil {
 		ncs.Close()
+	}
+	if ncr != nil {
+		ncr.Close()
 	}
 	if nc != nil {
 		nc.Close()
@@ -3810,4 +4678,53 @@ func (s *StanServer) Shutdown() {
 
 	// Wait for go-routines to return
 	s.wg.Wait()
+}
+
+// Apply log is invoked once a log entry is committed.
+// It returns a value which will be made available in the
+// ApplyFuture returned by Raft.Apply method if that
+// method was called on the same Raft node as the FSM.
+func (s *StanServer) Apply(l *raft.Log) interface{} {
+	op := &spb.RaftOperation{}
+	if err := op.Unmarshal(l.Data); err != nil {
+		panic(err)
+	}
+	switch op.OpType {
+	case spb.RaftOperation_Connect:
+		// Client connection replication.
+		return s.processConnect(op.ClientConnect.ClientID, op.ClientConnect.HeartbeatInbox, op.ClientConnect.Refresh)
+	case spb.RaftOperation_Disconnect:
+		// Client disconnect replication.
+		if op.ClientDisconnect.Schedule {
+			reply := op.ClientDisconnect.Reply
+			// Only send a reply if we are the server that proposed the
+			// disconnect.
+			if op.Leader != s.opts.Clustering.NodeID {
+				reply = ""
+			}
+			s.scheduleConnClose(op.ClientDisconnect.ClientID, reply)
+		} else {
+			s.closeClient(op.ClientDisconnect.ClientID)
+		}
+		return nil
+	default:
+		panic(fmt.Sprintf("unknown op type %s", op.OpType))
+	}
+}
+
+// Snapshot is used to support log compaction. This call should
+// return an FSMSnapshot which can be used to save a point-in-time
+// snapshot of the FSM. Apply and Snapshot are not called in multiple
+// threads, but Apply will be called concurrently with Persist. This means
+// the FSM should be implemented in a fashion that allows for concurrent
+// updates while a snapshot is happening.
+func (s *StanServer) Snapshot() (raft.FSMSnapshot, error) {
+	return newServerSnapshot(s), nil
+}
+
+// Restore is used to restore an FSM from a snapshot. It is not called
+// concurrently with any other command. The FSM must discard all previous
+// state.
+func (s *StanServer) Restore(snapshot io.ReadCloser) error {
+	return s.restoreFromSnapshot(snapshot)
 }
